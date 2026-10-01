@@ -3899,6 +3899,17 @@ export class BaileysStartupService extends ChannelStartupService {
     let indexValueMap: Record<string, { valueMac: Buffer }> = {};
     let skippedRemoves = 0;
     let lastCheck: { mac: any; keyId: any; version: number } | null = null;
+    // darnabt 2026-10-01: check the MAC at EVERY step, not just the last. Another device whose own
+    // state broke (WA Web "MacMismatchFatal") uploads patches with a wrong snapshot MAC; the records
+    // are still fine, so a hash rebuilt from all records that matched an earlier honest MAC is right.
+    const macMatched: number[] = [];
+    const macMismatched: number[] = [];
+    const checkStep = async (mac: any, keyIdBytes: any, v: number) => {
+      if (!mac) return;
+      const computed = await macOf(hash, v, keyIdBytes);
+      if (!computed) return;
+      (Buffer.compare(computed, Buffer.from(mac)) === 0 ? macMatched : macMismatched).push(v);
+    };
 
     for (let round = 0; round < 50; round++) {
       const result = await sock.query({
@@ -3930,6 +3941,7 @@ export class BaileysStartupService extends ChannelStartupService {
         hash = Buffer.from(await LT_HASH_ANTI_TAMPERING.subtractThenAdd(new Uint8Array(128).buffer, adds, []));
         version = Number(snapshot.version?.version || 0);
         lastCheck = { mac: snapshot.mac, keyId: snapshot.keyId?.id, version };
+        await checkStep(snapshot.mac, snapshot.keyId?.id, version);
       }
       for (const patch of patches) {
         if (patch.externalMutations) {
@@ -3959,6 +3971,7 @@ export class BaileysStartupService extends ChannelStartupService {
         hash = Buffer.from(await LT_HASH_ANTI_TAMPERING.subtractThenAdd(new Uint8Array(hash).buffer, adds, subs));
         version = Number(patch.version?.version || version + 1);
         lastCheck = { mac: patch.snapshotMac, keyId: patch.keyId?.id, version };
+        await checkStep(patch.snapshotMac, patch.keyId?.id, version);
       }
       if (!hasMorePatches) break;
     }
@@ -3974,7 +3987,9 @@ export class BaileysStartupService extends ChannelStartupService {
           : 'MISMATCH';
     }
     this.logger.warn(
-      `app-state ${name}: rebuilt from server at v${version}; MAC check ${macResult}; skipped ${skippedRemoves} orphan removes; myAppStateKeyId=${myKeyId}; key decrypt sample ${JSON.stringify(
+      `app-state ${name}: rebuilt from server at v${version}; MAC check ${macResult} (matched at v${
+        macMatched.slice(-5).join(',v') || '-'
+      }; mismatched at v${macMismatched.slice(-5).join(',v') || '-'}); skipped ${skippedRemoves} orphan removes; myAppStateKeyId=${myKeyId}; key decrypt sample ${JSON.stringify(
         keyStats,
       )}`,
     );
@@ -3984,8 +3999,15 @@ export class BaileysStartupService extends ChannelStartupService {
         `this linked device's own app-state key (${myKeyId}) cannot decrypt ${name} records it should own — WhatsApp would not accept our change`,
       );
     }
-    if (macResult === 'MISMATCH') {
+    if (macResult === 'MISMATCH' && !(macMatched.length && skippedRemoves === 0)) {
       throw new Error(`rebuilt ${name} state does not match WhatsApp's MAC at v${version} — not uploading`);
+    }
+    if (macResult === 'MISMATCH') {
+      this.logger.warn(
+        `app-state ${name}: last MAC (v${version}) came from a device with a broken state; our rebuild matched v${
+          macMatched[macMatched.length - 1]
+        } and is built from every record — uploading on the true hash`,
+      );
     }
     await keys.set({ 'app-state-sync-version': { [name]: state } });
     return state;
