@@ -794,8 +794,17 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
+      // darnabt: forward the unread state so "Mark as unread"/"Mark as read" on the phone or
+      // WhatsApp Web reaches the webhook. Baileys: unreadCount -1 = marked unread (app-state
+      // markChatAsReadAction), 0 = marked read, n > 0 = new-message tally. Stock dropped it.
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        const raw: { remoteJid: string; instanceId: string; unreadCount?: number; markedAsUnread?: boolean } = {
+          remoteJid: chat.id,
+          instanceId: this.instanceId,
+        };
+        if (typeof chat.unreadCount === 'number') raw.unreadCount = chat.unreadCount;
+        if (typeof chat.markedAsUnread === 'boolean') raw.markedAsUnread = chat.markedAsUnread;
+        return raw;
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
