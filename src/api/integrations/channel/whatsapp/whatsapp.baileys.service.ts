@@ -4625,13 +4625,42 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException('Last message not found');
       }
 
+      // darnabt: WhatsApp keeps every 1:1 chat under its @lid. A caller that only knows the phone
+      // number gets the LID looked up here (Baileys' store first, then one USync query to WhatsApp —
+      // no message is sent) and the answer names it, so the caller can keep the pair.
+      let chatJid = createJid(number);
+      let lid: string | null = null;
+      if (chatJid.endsWith('@s.whatsapp.net')) {
+        try {
+          const found = await this.client.signalRepository.lidMapping.getLIDForPN(chatJid);
+          if (found) lid = jidNormalizedUser(found);
+        } catch (e) {
+          this.logger.warn(`mark ${read ? 'read' : 'unread'}: LID lookup failed for ${chatJid}: ${e}`);
+        }
+        if (lid) chatJid = lid;
+      }
+
+      const ts = Number(last_message.messageTimestamp) || Math.floor(Date.now() / 1000);
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      // darnabt: WhatsApp (Web: WAWebMarkChatAsReadSync + WAWebMessageRangeUtils.compareMessageRanges)
+      // applies an UNREAD mark only when the mark's message range ENCLOSES the chat's own newest
+      // messages: every newer message must be listed by id, or be older than lastMessageTimestamp.
+      // A caller whose newest known message is not WhatsApp's newest (a message it never stored)
+      // was silently ignored. "Unread as of now" encloses whatever the chat holds, so stamp the
+      // range with the current time; the named message keeps its real timestamp.
+      // A READ mark keeps the real timestamp (it must never cover messages nobody has seen).
+      const messageRange = {
+        lastMessageTimestamp: read ? ts : Math.max(ts, nowSeconds),
+        messages: [{ key: { ...last_message.key, remoteJid: chatJid }, timestamp: ts }],
+      };
+
       const appStateVersion = await this.sendAppPatchChecked(
-        chatModificationToAppPatch({ markRead: read, lastMessages: [last_message] } as any, createJid(number)),
+        chatModificationToAppPatch({ markRead: read, lastMessages: messageRange } as any, chatJid),
       );
 
       return read
-        ? { chatId: number, markedChatRead: true, appStateVersion }
-        : { chatId: number, markedChatUnread: true, appStateVersion };
+        ? { chatId: chatJid, markedChatRead: true, appStateVersion, ...(lid ? { lid } : {}) }
+        : { chatId: chatJid, markedChatUnread: true, appStateVersion, ...(lid ? { lid } : {}) };
     } catch (error) {
       throw new InternalServerErrorException({
         [read ? 'markedChatRead' : 'markedChatUnread']: false,
