@@ -3964,6 +3964,214 @@ export class BaileysStartupService extends ChannelStartupService {
     throw new Error(`WhatsApp rejected the ${name} change: ${lastError}`);
   }
 
+  // Read one collection from WhatsApp's server WITHOUT decrypting or changing local state:
+  // which app-state key ids its snapshot/patches use, and how many sampled records each of
+  // our stored keys can decrypt (ok / bad = "bad decrypt" / missing = we hold no such key).
+  private async scanAppStateKeys(name: string) {
+    const sock: any = this.client;
+    const keys: any = sock.authState.keys;
+    const keyIds = new Set<string>();
+    const stats: Record<string, { ok: number; bad: number; missing: number }> = {};
+    const derived: Record<string, any> = {};
+    const b64 = (bytes: any) => Buffer.from(bytes || []).toString('base64');
+    const addId = (bytes: any) => {
+      const id = b64(bytes);
+      if (id) keyIds.add(id);
+    };
+    const sample = async (record: any) => {
+      const id = b64(record?.keyId?.id);
+      if (!id) return;
+      keyIds.add(id);
+      const st = (stats[id] = stats[id] || { ok: 0, bad: 0, missing: 0 });
+      if (st.ok + st.bad + st.missing >= 10) return;
+      if (!(id in derived)) {
+        const key = (await keys.get('app-state-sync-key', [id]))[id];
+        derived[id] = key?.keyData ? await hkdf(Buffer.from(key.keyData), 160, { info: 'WhatsApp Mutation Keys' }) : null;
+      }
+      if (!derived[id]) {
+        st.missing++;
+        return;
+      }
+      try {
+        const blob = Buffer.from(record.value.blob);
+        aesDecrypt(blob.slice(0, -32), derived[id].slice(32, 64));
+        st.ok++;
+      } catch {
+        st.bad++;
+      }
+    };
+
+    let version = 0;
+    for (let round = 0; round < 50; round++) {
+      const result = await sock.query({
+        tag: 'iq',
+        attrs: { to: S_WHATSAPP_NET, xmlns: 'w:sync:app:state', type: 'set' },
+        content: [
+          {
+            tag: 'sync',
+            attrs: {},
+            content: [
+              { tag: 'collection', attrs: { name, version: version.toString(), return_snapshot: (!version).toString() } },
+            ],
+          },
+        ],
+      });
+      const replyError = this.appStateReplyError(result, name);
+      if (replyError) throw new Error(`WhatsApp refused to send ${name} state: ${replyError}`);
+      const decoded: any = await extractSyncdPatches(result, {} as any);
+      const { patches = [], hasMorePatches = false, snapshot = undefined } = decoded[name] || {};
+      if (snapshot) {
+        addId(snapshot.keyId?.id);
+        for (const record of snapshot.records || []) await sample(record);
+        version = Number(snapshot.version?.version || 0);
+      }
+      for (const patch of patches) {
+        addId(patch.keyId?.id);
+        if (patch.externalMutations) {
+          const ext = await downloadExternalPatch(patch.externalMutations, {} as any);
+          patch.mutations = [...(patch.mutations || []), ...(ext.mutations || [])];
+        }
+        for (const m of patch.mutations || []) await sample(m.record);
+        version = Number(patch.version?.version || version + 1);
+      }
+      if (!hasMorePatches) break;
+    }
+    const total = Object.values(stats).reduce(
+      (acc, s) => ({ ok: acc.ok + s.ok, bad: acc.bad + s.bad, missing: acc.missing + s.missing }),
+      { ok: 0, bad: 0, missing: 0 },
+    );
+    return { version, keyIds: [...keyIds], stats, total };
+  }
+
+  // Repair a linked device whose stored app-state sync keys are wrong ("bad decrypt" when
+  // resyncing regular_low etc.) WITHOUT re-linking: ask our own primary phone to re-share the
+  // keys with an APP_STATE_SYNC_KEY_REQUEST — a hidden peer protocol message to our own JID,
+  // the same one WhatsApp Web sends; never a chat message. Baileys stores the keys from the
+  // phone's APP_STATE_SYNC_KEY_SHARE answer itself; then every collection is resynced from
+  // its server snapshot. The reply says plainly whether the phone answered and what synced.
+  public async requestAppStateKeys(data: { collections?: string[]; keyIds?: string[]; waitSeconds?: number }) {
+    const sock: any = this.client;
+    if (!sock?.authState?.creds?.me?.id || this.stateConnection?.state !== 'open') {
+      throw new BadRequestException('Instance is not connected');
+    }
+    const keys: any = sock.authState.keys;
+    const collections =
+      Array.isArray(data?.collections) && data.collections.length
+        ? data.collections
+        : ['regular_low', 'regular_high', 'regular', 'critical_block', 'critical_unblock_low'];
+    const waitMs = Math.min(Math.max(Number(data?.waitSeconds ?? 90), 5), 280) * 1000;
+    const myKeyIdBefore: string = sock.authState.creds.myAppStateKeyId;
+
+    // 1. key ids the server data uses + what we can decrypt now
+    const before: Record<string, any> = {};
+    const keyIdSet = new Set<string>(Array.isArray(data?.keyIds) ? data.keyIds : []);
+    if (myKeyIdBefore) keyIdSet.add(myKeyIdBefore);
+    for (const name of collections) {
+      try {
+        const scan = await this.scanAppStateKeys(name);
+        scan.keyIds.forEach((id) => keyIdSet.add(id));
+        before[name] = { version: scan.version, keys: scan.keyIds.length, decrypt: scan.total };
+      } catch (error) {
+        before[name] = { error: String(error) };
+      }
+    }
+    const keyIds = [...keyIdSet];
+    const fingerprint = async () => {
+      const got = await keys.get('app-state-sync-key', keyIds);
+      const out: Record<string, string | null> = {};
+      for (const id of keyIds) {
+        out[id] = got[id]?.keyData
+          ? createHash('sha256').update(Buffer.from(got[id].keyData)).digest('hex').slice(0, 12)
+          : null;
+      }
+      return out;
+    };
+    const fpBefore = await fingerprint();
+
+    // 2. ask the phone, wait for its key share
+    const shared: string[] = [];
+    let shares = 0;
+    const onUpsert = ({ messages }: any) => {
+      for (const m of messages || []) {
+        const p = m?.message?.protocolMessage;
+        if (p?.type === proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE) {
+          shares++;
+          for (const k of p.appStateSyncKeyShare?.keys || []) {
+            shared.push(Buffer.from(k?.keyId?.keyId || []).toString('base64'));
+          }
+        }
+      }
+    };
+    sock.ev.on('messages.upsert', onUpsert);
+    let requestId = '';
+    const startedAt = Date.now();
+    try {
+      const meJid = jidNormalizedUser(sock.authState.creds.me.id);
+      requestId = await sock.relayMessage(
+        meJid,
+        {
+          protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_REQUEST,
+            appStateSyncKeyRequest: { keyIds: keyIds.map((id) => ({ keyId: Buffer.from(id, 'base64') })) },
+          },
+        },
+        {
+          additionalAttributes: { category: 'peer', push_priority: 'high_force' },
+          additionalNodes: [{ tag: 'meta', attrs: { appdata: 'default' } }],
+        },
+      );
+      this.logger.warn(`app-state key request ${requestId} sent to own phone for ${keyIds.length} key ids`);
+      while (Date.now() - startedAt < waitMs && shares === 0) await delay(2000);
+      if (shares) await delay(4000); // let Baileys finish storing the keys
+    } finally {
+      sock.ev.off('messages.upsert', onUpsert);
+    }
+    const fpAfter = await fingerprint();
+    const changed = keyIds.filter((id) => fpBefore[id] !== fpAfter[id]);
+    const answer = {
+      requestId,
+      requestedKeyIds: keyIds.length,
+      phoneAnswered: shares > 0,
+      waitedSeconds: Math.round((Date.now() - startedAt) / 1000),
+      sharedKeyIds: shared.length,
+      keysChanged: changed.length,
+      myAppStateKeyId: { before: myKeyIdBefore, after: sock.authState.creds.myAppStateKeyId },
+    };
+    this.logger.warn(`app-state key request result: ${JSON.stringify(answer)}`);
+    if (!shares && !changed.length) {
+      return { ok: false, ...answer, before, message: 'The phone did not answer the key request; nothing was changed.' };
+    }
+
+    // 3. resync every collection from its server snapshot with the fresh keys
+    const resync: Record<string, string> = {};
+    for (const name of collections) {
+      await keys.set({ 'app-state-sync-version': { [name]: null } });
+      this.appStateRebuilt.delete(name);
+      try {
+        await sock.resyncAppState([name], true);
+      } catch (error) {
+        resync[name] = `error: ${error}`;
+        continue;
+      }
+      const state = (await keys.get('app-state-sync-version', [name]))[name];
+      resync[name] = state ? `synced v${state.version}` : 'FAILED (Baileys dropped it — LOG_BAILEYS=info shows why)';
+    }
+
+    // 4. decrypt check again
+    const after: Record<string, any> = {};
+    for (const name of collections) {
+      try {
+        const scan = await this.scanAppStateKeys(name);
+        after[name] = { version: scan.version, decrypt: scan.total };
+      } catch (error) {
+        after[name] = { error: String(error) };
+      }
+    }
+    this.logger.warn(`app-state resync after key share: ${JSON.stringify({ resync, after })}`);
+    const ok = collections.every((n) => resync[n]?.startsWith('synced'));
+    return { ok, ...answer, before, resync, after };
+  }
+
   public async archiveChat(data: ArchiveChatDto) {
     try {
       let last_message = data.lastMessage;

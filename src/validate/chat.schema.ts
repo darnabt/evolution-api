@@ -91,6 +91,16 @@ export const archiveChatSchema: JSONSchema7 = {
   required: ['archive'],
 };
 
+export const requestAppStateKeysSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    collections: { type: 'array', items: { type: 'string' } },
+    keyIds: { type: 'array', items: { type: 'string' } },
+    waitSeconds: { type: 'number' },
+  },
+};
+
 export const markChatUnreadSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

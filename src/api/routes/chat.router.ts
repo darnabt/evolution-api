@@ -34,6 +34,7 @@ import {
   profileSchema,
   profileStatusSchema,
   readMessageSchema,
+  requestAppStateKeysSchema,
   updateMessageSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
@@ -89,6 +90,17 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
+      })
+      // one-off repair: re-request app-state sync keys from our own phone, then resync (no re-link)
+      .post(this.routerPath('requestAppStateKeys'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<any>({
+          request: req,
+          schema: requestAppStateKeysSchema,
+          ClassRef: Object,
+          execute: (instance, data) => chatController.requestAppStateKeys(instance, data),
+        });
+
+        return res.status(response?.ok ? HttpStatus.OK : HttpStatus.INTERNAL_SERVER_ERROR).json(response);
       })
       .delete(this.routerPath('deleteMessageForEveryone'), ...guards, async (req, res) => {
         const response = await this.dataValidate<DeleteMessage>({

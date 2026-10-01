@@ -17,6 +17,7 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { BadRequestException } from '@exceptions';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
 
 export class ChatController {
@@ -36,6 +37,14 @@ export class ChatController {
 
   public async markChatUnread({ instanceName }: InstanceDto, data: MarkChatUnreadDto) {
     return await this.waMonitor.waInstances[instanceName].markChatUnread(data);
+  }
+
+  public async requestAppStateKeys({ instanceName }: InstanceDto, data: any) {
+    const instance: any = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.requestAppStateKeys !== 'function') {
+      throw new BadRequestException('Only Baileys instances hold app-state keys');
+    }
+    return await instance.requestAppStateKeys(data || {});
   }
 
   public async deleteMessage({ instanceName }: InstanceDto, data: DeleteMessage) {
