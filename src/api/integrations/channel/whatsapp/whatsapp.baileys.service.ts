@@ -812,12 +812,28 @@ export class BaileysStartupService extends ChannelStartupService {
       // WhatsApp Web reaches the webhook. Baileys: unreadCount -1 = marked unread (app-state
       // markChatAsReadAction), 0 = marked read, n > 0 = new-message tally. Stock dropped it.
       const chatsRaw = chats.map((chat) => {
-        const raw: { remoteJid: string; instanceId: string; unreadCount?: number; markedAsUnread?: boolean } = {
+        const raw: {
+          remoteJid: string;
+          instanceId: string;
+          unreadCount?: number;
+          markedAsUnread?: boolean;
+          pinned?: number | null;
+          archived?: boolean;
+        } = {
           remoteJid: chat.id,
           instanceId: this.instanceId,
         };
         if (typeof chat.unreadCount === 'number') raw.unreadCount = chat.unreadCount;
         if (typeof chat.markedAsUnread === 'boolean') raw.markedAsUnread = chat.markedAsUnread;
+        // darnabt: pin / archive done on the phone or WhatsApp Web (app-state pinAction /
+        // archiveChatAction). Baileys: pinned = pin time in seconds, null = unpinned;
+        // archived = true/false. Nawah orders and hides its chat list by them.
+        if ('pinned' in chat) {
+          const p = chat.pinned as unknown as number | { toNumber?: () => number } | null | undefined;
+          const n = p == null ? 0 : typeof p === 'number' ? p : (p.toNumber?.() ?? Number(p));
+          raw.pinned = n > 0 ? n : null;
+        }
+        if (typeof chat.archived === 'boolean') raw.archived = chat.archived;
         return raw;
       });
 
