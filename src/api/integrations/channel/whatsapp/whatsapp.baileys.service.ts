@@ -4649,9 +4649,13 @@ export class BaileysStartupService extends ChannelStartupService {
       // was silently ignored. "Unread as of now" encloses whatever the chat holds, so stamp the
       // range with the current time; the named message keeps its real timestamp.
       // A READ mark keeps the real timestamp (it must never cover messages nobody has seen).
+      // A group message from someone else must name its sender, or WhatsApp rejects the whole range
+      // (MESSAGE_RANGE_MESSAGE_KEY_PARTICIPANT_UNSET); without it the range goes by time alone.
+      const key: any = { ...last_message.key, remoteJid: chatJid };
+      const keyUsable = !(chatJid.endsWith('@g.us') && !key.fromMe && !key.participant);
       const messageRange = {
         lastMessageTimestamp: read ? ts : Math.max(ts, nowSeconds),
-        messages: [{ key: { ...last_message.key, remoteJid: chatJid }, timestamp: ts }],
+        ...(keyUsable ? { messages: [{ key, timestamp: ts }] } : {}),
       };
 
       const appStateVersion = await this.sendAppPatchChecked(
