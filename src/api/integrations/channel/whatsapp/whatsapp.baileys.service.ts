@@ -811,9 +811,23 @@ export class BaileysStartupService extends ChannelStartupService {
       // darnabt: forward the unread state so "Mark as unread"/"Mark as read" on the phone or
       // WhatsApp Web reaches the webhook. Baileys: unreadCount -1 = marked unread (app-state
       // markChatAsReadAction), 0 = marked read, n > 0 = new-message tally. Stock dropped it.
+      // darnabt: a chat the phone stores under a @lid — also name its phone JID (Baileys' LID
+      // store), so the receiver can find the chat even when it never saw that LID before.
+      const altOf: Record<string, string> = {};
+      for (const chat of chats) {
+        const id = chat.id;
+        if (typeof id !== 'string' || !id.endsWith('@lid') || id in altOf) continue;
+        try {
+          const pn = await this.client.signalRepository.lidMapping.getPNForLID(jidNormalizedUser(id));
+          if (pn) altOf[id] = jidNormalizedUser(pn);
+        } catch {
+          // no mapping known — the receiver falls back to its own LID book
+        }
+      }
       const chatsRaw = chats.map((chat) => {
         const raw: {
           remoteJid: string;
+          remoteJidAlt?: string;
           instanceId: string;
           unreadCount?: number;
           markedAsUnread?: boolean;
@@ -823,6 +837,7 @@ export class BaileysStartupService extends ChannelStartupService {
           remoteJid: chat.id,
           instanceId: this.instanceId,
         };
+        if (altOf[chat.id]) raw.remoteJidAlt = altOf[chat.id];
         if (typeof chat.unreadCount === 'number') raw.unreadCount = chat.unreadCount;
         if (typeof chat.markedAsUnread === 'boolean') raw.markedAsUnread = chat.markedAsUnread;
         // darnabt: pin / archive done on the phone or WhatsApp Web (app-state pinAction /
@@ -4377,7 +4392,7 @@ export class BaileysStartupService extends ChannelStartupService {
   // written: no local state, no events, no webhooks. Nawah uses it to reconcile its read/unread
   // dots with what the phone and WhatsApp Web show (mark-unread, read marks, archive, pin, mute).
   // markChatAsRead.read=false = "marked unread"; read=true covers messages up to rangeLastTs (s).
-  public async appStateChats(data: { collections?: string[] }) {
+  public async appStateChats(data: { collections?: string[]; trace?: string[] }) {
     const sock: any = this.client;
     if (!sock?.authState || this.stateConnection?.state !== 'open') {
       throw new BadRequestException('Instance is not connected');
@@ -4396,6 +4411,10 @@ export class BaileysStartupService extends ChannelStartupService {
       return derived[id];
     };
     type Entry = { index: string[]; value: any };
+    // darnabt: `trace: [jid, ...]` lists every mutation WhatsApp holds for those chats, in order
+    // (snapshot, then each patch: SET / REMOVE, value, writer key) — to debug what a device wrote.
+    const traceJids = new Set(Array.isArray(data?.trace) ? data.trace.filter((j) => typeof j === 'string') : []);
+    const trace: any[] = [];
     const stats: Record<string, { version: number; records: number; decrypted: number; failed: number }> = {};
     const chats: Record<string, any> = {};
     const chat = (jid: string) => (chats[jid] = chats[jid] || { jid });
@@ -4403,9 +4422,37 @@ export class BaileysStartupService extends ChannelStartupService {
     for (const name of collections) {
       const live: Record<string, Entry> = {}; // keyed by index MAC (base64) — REMOVE needs no decrypt
       const st = (stats[name] = { version: 0, records: 0, decrypted: 0, failed: 0 });
-      const apply = async (record: any, remove: boolean) => {
+      const note = (index: string[], value: any, op: string, at: string, record: any) => {
+        if (!traceJids.has(index?.[1])) return;
+        const m = value?.markChatAsReadAction;
+        trace.push({
+          collection: name,
+          at,
+          op,
+          type: index[0],
+          jid: index[1],
+          ...(m ? { read: !!m.read } : {}),
+          ...(value?.archiveChatAction ? { archived: !!value.archiveChatAction.archived } : {}),
+          ...(value?.pinAction ? { pinned: !!value.pinAction.pinned } : {}),
+          ts: num(value?.timestamp),
+          keyId: Buffer.from(record?.keyId?.id || []).toString('base64'),
+        });
+      };
+      const apply = async (record: any, remove: boolean, at: string) => {
         const indexMac = Buffer.from(record?.index?.blob || []).toString('base64');
         if (remove) {
+          if (traceJids.size) {
+            // a REMOVE carries the retired record: decode it for the trace only
+            try {
+              const expandedOld = await keyFor(record?.keyId?.id);
+              const blobOld = Buffer.from(record.value.blob);
+              const plainOld = aesDecrypt(blobOld.slice(0, -32), expandedOld.slice(32, 64));
+              const actionOld = proto.SyncActionData.decode(plainOld);
+              note(JSON.parse(Buffer.from(actionOld.index).toString()), actionOld.value, 'REMOVE', at, record);
+            } catch {
+              if (live[indexMac]) note(live[indexMac].index, live[indexMac].value, 'REMOVE (undecoded)', at, record);
+            }
+          }
           delete live[indexMac];
           return;
         }
@@ -4420,6 +4467,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const action = proto.SyncActionData.decode(plain);
           live[indexMac] = { index: JSON.parse(Buffer.from(action.index).toString()), value: action.value };
           st.decrypted++;
+          if (traceJids.size) note(live[indexMac].index, action.value, 'SET', at, record);
         } catch {
           st.failed++;
         }
@@ -4445,18 +4493,18 @@ export class BaileysStartupService extends ChannelStartupService {
         const { patches = [], hasMorePatches = false, snapshot = undefined } = decoded[name] || {};
         if (snapshot) {
           for (const k of Object.keys(live)) delete live[k];
-          for (const record of snapshot.records || []) await apply(record, false);
           version = Number(snapshot.version?.version || 0);
+          for (const record of snapshot.records || []) await apply(record, false, `snapshot v${version}`);
         }
         for (const patch of patches) {
           if (patch.externalMutations) {
             const ext = await downloadExternalPatch(patch.externalMutations, {} as any);
             patch.mutations = [...(patch.mutations || []), ...(ext.mutations || [])];
           }
-          for (const m of patch.mutations || []) {
-            await apply(m.record, m.operation === proto.SyncdMutation.SyncdOperation.REMOVE);
-          }
           version = Number(patch.version?.version || version + 1);
+          for (const m of patch.mutations || []) {
+            await apply(m.record, m.operation === proto.SyncdMutation.SyncdOperation.REMOVE, `patch v${version}`);
+          }
         }
         if (!hasMorePatches) break;
       }
@@ -4488,8 +4536,23 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
     const list = Object.values(chats);
+    // darnabt: name the phone JID of every @lid chat we know a pair for (Baileys' LID store), so
+    // the reconcile can match chats whose LID the receiver never saw.
+    const lidChats = list.filter((c) => typeof c.jid === 'string' && c.jid.endsWith('@lid'));
+    for (let i = 0; i < lidChats.length; i += 50) {
+      await Promise.all(
+        lidChats.slice(i, i + 50).map(async (c) => {
+          try {
+            const pn = await sock.signalRepository.lidMapping.getPNForLID(c.jid);
+            if (pn) c.pn = jidNormalizedUser(pn);
+          } catch {
+            // unknown pair — left without a phone
+          }
+        }),
+      );
+    }
     this.logger.info(`app-state chats read: ${list.length} chats ${JSON.stringify(stats)}`);
-    return { ok: true, collections: stats, chats: list };
+    return { ok: true, collections: stats, chats: list, ...(traceJids.size ? { trace } : {}) };
   }
 
   public async archiveChat(data: ArchiveChatDto) {
