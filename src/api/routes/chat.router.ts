@@ -113,6 +113,17 @@ export class ChatRouter extends RouterBroker {
 
         return res.status(response?.ok ? HttpStatus.OK : HttpStatus.INTERNAL_SERVER_ERROR).json(response);
       })
+      // read-only: per-chat read/unread, archive, pin, mute from WhatsApp's app-state server copy
+      .post(this.routerPath('appStateChats'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<any>({
+          request: req,
+          schema: requestAppStateKeysSchema,
+          ClassRef: Object,
+          execute: (instance, data) => chatController.appStateChats(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
       .delete(this.routerPath('deleteMessageForEveryone'), ...guards, async (req, res) => {
         const response = await this.dataValidate<DeleteMessage>({
           request: req,

@@ -4298,6 +4298,126 @@ export class BaileysStartupService extends ChannelStartupService {
     return { ok, ...answer, before, resync, after };
   }
 
+  // darnabt 2026-10-01: READ-ONLY per-chat state straight from WhatsApp's app-state server copy
+  // (snapshot + every patch of regular_low / regular_high), decrypted with our keys. Nothing is
+  // written: no local state, no events, no webhooks. Nawah uses it to reconcile its read/unread
+  // dots with what the phone and WhatsApp Web show (mark-unread, read marks, archive, pin, mute).
+  // markChatAsRead.read=false = "marked unread"; read=true covers messages up to rangeLastTs (s).
+  public async appStateChats(data: { collections?: string[] }) {
+    const sock: any = this.client;
+    if (!sock?.authState || this.stateConnection?.state !== 'open') {
+      throw new BadRequestException('Instance is not connected');
+    }
+    const keys: any = sock.authState.keys;
+    const collections =
+      Array.isArray(data?.collections) && data.collections.length ? data.collections : ['regular_low', 'regular_high'];
+    const num = (v: any) => (v === null || v === undefined ? null : Number(v?.toString?.() ?? v));
+    const derived: Record<string, Buffer | null> = {};
+    const keyFor = async (bytes: any) => {
+      const id = Buffer.from(bytes || []).toString('base64');
+      if (!(id in derived)) {
+        const key = (await keys.get('app-state-sync-key', [id]))[id];
+        derived[id] = key?.keyData ? await hkdf(Buffer.from(key.keyData), 160, { info: 'WhatsApp Mutation Keys' }) : null;
+      }
+      return derived[id];
+    };
+    type Entry = { index: string[]; value: any };
+    const stats: Record<string, { version: number; records: number; decrypted: number; failed: number }> = {};
+    const chats: Record<string, any> = {};
+    const chat = (jid: string) => (chats[jid] = chats[jid] || { jid });
+
+    for (const name of collections) {
+      const live: Record<string, Entry> = {}; // keyed by index MAC (base64) — REMOVE needs no decrypt
+      const st = (stats[name] = { version: 0, records: 0, decrypted: 0, failed: 0 });
+      const apply = async (record: any, remove: boolean) => {
+        const indexMac = Buffer.from(record?.index?.blob || []).toString('base64');
+        if (remove) {
+          delete live[indexMac];
+          return;
+        }
+        const expanded = await keyFor(record?.keyId?.id);
+        if (!expanded) {
+          st.failed++;
+          return;
+        }
+        try {
+          const blob = Buffer.from(record.value.blob);
+          const plain = aesDecrypt(blob.slice(0, -32), expanded.slice(32, 64));
+          const action = proto.SyncActionData.decode(plain);
+          live[indexMac] = { index: JSON.parse(Buffer.from(action.index).toString()), value: action.value };
+          st.decrypted++;
+        } catch {
+          st.failed++;
+        }
+      };
+      let version = 0;
+      for (let round = 0; round < 50; round++) {
+        const result = await sock.query({
+          tag: 'iq',
+          attrs: { to: S_WHATSAPP_NET, xmlns: 'w:sync:app:state', type: 'set' },
+          content: [
+            {
+              tag: 'sync',
+              attrs: {},
+              content: [
+                { tag: 'collection', attrs: { name, version: version.toString(), return_snapshot: (!version).toString() } },
+              ],
+            },
+          ],
+        });
+        const replyError = this.appStateReplyError(result, name);
+        if (replyError) throw new Error(`WhatsApp refused to send ${name} state: ${replyError}`);
+        const decoded: any = await extractSyncdPatches(result, {} as any);
+        const { patches = [], hasMorePatches = false, snapshot = undefined } = decoded[name] || {};
+        if (snapshot) {
+          for (const k of Object.keys(live)) delete live[k];
+          for (const record of snapshot.records || []) await apply(record, false);
+          version = Number(snapshot.version?.version || 0);
+        }
+        for (const patch of patches) {
+          if (patch.externalMutations) {
+            const ext = await downloadExternalPatch(patch.externalMutations, {} as any);
+            patch.mutations = [...(patch.mutations || []), ...(ext.mutations || [])];
+          }
+          for (const m of patch.mutations || []) {
+            await apply(m.record, m.operation === proto.SyncdMutation.SyncdOperation.REMOVE);
+          }
+          version = Number(patch.version?.version || version + 1);
+        }
+        if (!hasMorePatches) break;
+      }
+      st.version = version;
+      st.records = Object.keys(live).length;
+
+      for (const { index, value } of Object.values(live)) {
+        const [type, jid] = index;
+        if (!jid || typeof jid !== 'string') continue;
+        const at = num(value?.timestamp);
+        if (type === 'markChatAsRead' && value?.markChatAsReadAction) {
+          const a = value.markChatAsReadAction;
+          const r = a.messageRange || {};
+          Object.assign(chat(jid), {
+            read: !!a.read,
+            readAt: at,
+            rangeLastTs: num(r.lastMessageTimestamp) || num(r.lastSystemMessageTimestamp) || null,
+          });
+        } else if (type === 'archive' && value?.archiveChatAction) {
+          Object.assign(chat(jid), { archived: !!value.archiveChatAction.archived, archivedAt: at });
+        } else if (type === 'pin_v1' && value?.pinAction) {
+          Object.assign(chat(jid), { pinned: !!value.pinAction.pinned, pinnedAt: at });
+        } else if (type === 'mute' && value?.muteAction) {
+          Object.assign(chat(jid), {
+            muted: !!value.muteAction.muted,
+            muteEnd: num(value.muteAction.muteEndTimestamp),
+          });
+        }
+      }
+    }
+    const list = Object.values(chats);
+    this.logger.info(`app-state chats read: ${list.length} chats ${JSON.stringify(stats)}`);
+    return { ok: true, collections: stats, chats: list };
+  }
+
   public async archiveChat(data: ArchiveChatDto) {
     try {
       let last_message = data.lastMessage;

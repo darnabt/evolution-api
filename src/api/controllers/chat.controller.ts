@@ -55,6 +55,14 @@ export class ChatController {
     return await instance.requestAppStateKeys(data || {});
   }
 
+  public async appStateChats({ instanceName }: InstanceDto, data: any) {
+    const instance: any = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.appStateChats !== 'function') {
+      throw new BadRequestException('Only Baileys instances hold app state');
+    }
+    return await instance.appStateChats(data || {});
+  }
+
   public async deleteMessage({ instanceName }: InstanceDto, data: DeleteMessage) {
     return await this.waMonitor.waInstances[instanceName].deleteMessage(data);
   }
