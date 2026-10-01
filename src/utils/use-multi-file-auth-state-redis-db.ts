@@ -61,7 +61,10 @@ export async function useMultiFileAuthStateRedisDb(
             ids.map(async (id) => {
               let value = await readData(`${type}-${id}`);
               if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.create(value);
+                // darnabt: fromObject, not create — the key is saved through the proto toJSON, so keyData is a
+                // base64 STRING on disk; create() kept the string and every app-state key read back from
+                // disk (after the 5-min key cache) was garbage ("bad decrypt" / "Invalid patch mac").
+                value = proto.Message.AppStateSyncKeyData.fromObject(value);
               }
 
               data[id] = value;

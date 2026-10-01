@@ -91,6 +91,17 @@ export class ChatRouter extends RouterBroker {
 
         return res.status(HttpStatus.CREATED).json(response);
       })
+      // darnabt: the opposite of markChatUnread — clears a manual "unread" mark on the phone / Web
+      .post(this.routerPath('markChatRead'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<MarkChatUnreadDto>({
+          request: req,
+          schema: markChatUnreadSchema,
+          ClassRef: MarkChatUnreadDto,
+          execute: (instance, data) => chatController.markChatRead(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
+      })
       // one-off repair: re-request app-state sync keys from our own phone, then resync (no re-link)
       .post(this.routerPath('requestAppStateKeys'), ...guards, async (req, res) => {
         const response = await this.dataValidate<any>({

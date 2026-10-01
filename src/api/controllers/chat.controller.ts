@@ -39,6 +39,14 @@ export class ChatController {
     return await this.waMonitor.waInstances[instanceName].markChatUnread(data);
   }
 
+  public async markChatRead({ instanceName }: InstanceDto, data: MarkChatUnreadDto) {
+    const instance: any = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.markChatRead !== 'function') {
+      throw new BadRequestException('Only Baileys instances can mark a chat read');
+    }
+    return await instance.markChatRead(data);
+  }
+
   public async requestAppStateKeys({ instanceName }: InstanceDto, data: any) {
     const instance: any = this.waMonitor.waInstances[instanceName];
     if (typeof instance?.requestAppStateKeys !== 'function') {

@@ -666,7 +666,10 @@ export class BaileysStartupService extends ChannelStartupService {
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
-        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
+        keys: makeCacheableSignalKeyStore(
+          this.watchAppStateDrops(this.instance.authState.state.keys),
+          P({ level: 'error' }) as any,
+        ),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
@@ -3753,6 +3756,83 @@ export class BaileysStartupService extends ChannelStartupService {
   // snapshot, and (4) throw when WhatsApp did not accept it.
   private appStateRebuilt = new Set<string>();
 
+  // darnabt 2026-10-01: Baileys drops a collection's state (sets it to null) whenever an incoming
+  // app-state sync fails ("bad decrypt", "Invalid patch mac", missing key) and then simply gives
+  // up — phone/Web mark-read/unread stop reaching the webhook with nothing in the logs at error
+  // level. Watch for that drop and heal: wrong/missing keys -> re-request them from our own phone
+  // (resyncs too); keys fine -> rebuild the state from the server so the next change applies.
+  private appStateOwnWrite = false;
+  private appStateHealTimer: NodeJS.Timeout | null = null;
+  private appStateHealPending = new Set<string>();
+  private appStateLastKeyRequest = 0;
+
+  private watchAppStateDrops(keys: any) {
+    return {
+      ...keys,
+      get: (type: any, ids: any) => keys.get(type, ids),
+      set: async (data: any) => {
+        const versions = data?.['app-state-sync-version'];
+        if (versions && !this.appStateOwnWrite) {
+          for (const name of Object.keys(versions)) {
+            if (versions[name] === null) this.scheduleAppStateHeal(name);
+          }
+        }
+        return keys.set(data);
+      },
+    };
+  }
+
+  private scheduleAppStateHeal(name: string) {
+    this.appStateHealPending.add(name);
+    if (this.appStateHealTimer) return;
+    this.appStateHealTimer = setTimeout(() => {
+      this.appStateHealTimer = null;
+      const names = [...this.appStateHealPending];
+      this.appStateHealPending.clear();
+      this.healAppState(names).catch((e) => this.logger.warn(`app-state heal failed: ${e}`));
+    }, 20_000);
+  }
+
+  private async healAppState(names: string[]) {
+    const sock: any = this.client;
+    if (!sock?.authState || this.stateConnection?.state !== 'open') return;
+    const keys: any = sock.authState.keys;
+    const dropped: string[] = [];
+    for (const name of names) {
+      const state = (await keys.get('app-state-sync-version', [name]))[name];
+      if (!state) dropped.push(name);
+    }
+    if (!dropped.length) return; // Baileys recovered on its own (retry from scratch worked)
+    let keysBad = false;
+    for (const name of dropped) {
+      try {
+        const scan = await this.scanAppStateKeys(name);
+        if (scan.total.bad + scan.total.missing > 0) keysBad = true;
+        this.logger.warn(`app-state heal: ${name} was dropped by Baileys; key check ${JSON.stringify(scan.total)}`);
+      } catch (error) {
+        this.logger.warn(`app-state heal: scan ${name} failed: ${error}`);
+      }
+    }
+    if (keysBad && Date.now() - this.appStateLastKeyRequest > 10 * 60_000) {
+      this.appStateLastKeyRequest = Date.now();
+      const r: any = await this.requestAppStateKeys({ waitSeconds: 30 });
+      this.logger.warn(`app-state heal: key re-request ok=${r?.ok} resync=${JSON.stringify(r?.resync ?? {})}`);
+      return;
+    }
+    const getKey = async (id: string) => (await keys.get('app-state-sync-key', [id]))[id];
+    for (const name of dropped) {
+      try {
+        this.appStateOwnWrite = true;
+        await this.rebuildAppStateFromServer(name, getKey);
+        this.appStateRebuilt.add(name);
+      } catch (error) {
+        this.logger.warn(`app-state heal: rebuild ${name} failed: ${error}`);
+      } finally {
+        this.appStateOwnWrite = false;
+      }
+    }
+  }
+
   private appStateReplyError(result: any, name: string): string | null {
     const sync = getBinaryNodeChild(result, 'sync');
     const collections = sync ? getBinaryNodeChildren(sync, 'collection') : [];
@@ -3922,19 +4002,38 @@ export class BaileysStartupService extends ChannelStartupService {
     const getKey = async (id: string) => (await keys.get('app-state-sync-key', [id]))[id];
 
     let lastError = '';
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    let keysRequested = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         // normal Baileys catch-up first, so new remote changes still fire chats.update
         await sock.resyncAppState(['regular_low', 'regular_high', 'regular'], false);
       } catch (error) {
         this.logger.warn(`app-state resync before ${name} patch failed: ${error}`);
       }
-      let state = (await keys.get('app-state-sync-version', [name]))[name];
-      if (!state || attempt > 1 || !this.appStateRebuilt.has(name)) {
+      // darnabt 2026-10-01: ALWAYS rebuild from WhatsApp's server copy and MAC-check it before
+      // uploading. The cached local state went stale twice today (07:22Z the phone re-uploaded
+      // every collection from v1; Baileys stacked the new patches on its old v206 hash) and our
+      // next patch carried a wrong snapshot MAC -> WA Web "failed validate snapshot mac".
+      let state: any;
+      try {
         state = await this.rebuildAppStateFromServer(name, getKey);
         this.appStateRebuilt.add(name);
+      } catch (error) {
+        lastError = String(error);
+        // wrong / missing app-state key -> ask our own phone for the keys once, then retry
+        if (!keysRequested && /decrypt|failed to find key|MISMATCH|check key missing/i.test(lastError)) {
+          keysRequested = true;
+          this.logger.warn(`app-state ${name}: ${lastError} -> re-requesting keys from the phone`);
+          await this.requestAppStateKeys({ waitSeconds: 25 }).catch((e) =>
+            this.logger.warn(`app-state key re-request failed: ${e}`),
+          );
+          continue;
+        }
+        throw error;
       }
-      const { patch, state: next } = await encodeSyncdPatch(patchCreate, myAppStateKeyId, state, getKey);
+      // the key request above can rotate our own key id -> read it fresh
+      const ownKeyId: string = sock.authState.creds.myAppStateKeyId || myAppStateKeyId;
+      const { patch, state: next } = await encodeSyncdPatch(patchCreate, ownKeyId, state, getKey);
       const result = await sock.query({
         tag: 'iq',
         attrs: { to: S_WHATSAPP_NET, type: 'set', xmlns: 'w:sync:app:state' },
@@ -4145,7 +4244,12 @@ export class BaileysStartupService extends ChannelStartupService {
     // 3. resync every collection from its server snapshot with the fresh keys
     const resync: Record<string, string> = {};
     for (const name of collections) {
-      await keys.set({ 'app-state-sync-version': { [name]: null } });
+      this.appStateOwnWrite = true;
+      try {
+        await keys.set({ 'app-state-sync-version': { [name]: null } });
+      } finally {
+        this.appStateOwnWrite = false;
+      }
       this.appStateRebuilt.delete(name);
       try {
         await sock.resyncAppState([name], true);
@@ -4203,6 +4307,16 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async markChatUnread(data: MarkChatUnreadDto) {
+    return this.setChatReadState(data, false);
+  }
+
+  // darnabt: "Mark as read" from Nawah. Read receipts alone never clear a chat that was marked
+  // unread by hand (phone / WhatsApp Web / Nawah) — that flag is app-state, so clear it there.
+  public async markChatRead(data: MarkChatUnreadDto) {
+    return this.setChatReadState(data, true);
+  }
+
+  private async setChatReadState(data: MarkChatUnreadDto, read: boolean) {
     try {
       let last_message = data.lastMessage;
       let number = data.chat;
@@ -4212,7 +4326,7 @@ export class BaileysStartupService extends ChannelStartupService {
       } else {
         last_message = data.lastMessage;
         last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
-        number = last_message?.key?.remoteJid;
+        number = data.chat || last_message?.key?.remoteJid;
       }
 
       if (!last_message || Object.keys(last_message).length === 0) {
@@ -4220,14 +4334,16 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const appStateVersion = await this.sendAppPatchChecked(
-        chatModificationToAppPatch({ markRead: false, lastMessages: [last_message] } as any, createJid(number)),
+        chatModificationToAppPatch({ markRead: read, lastMessages: [last_message] } as any, createJid(number)),
       );
 
-      return { chatId: number, markedChatUnread: true, appStateVersion };
+      return read
+        ? { chatId: number, markedChatRead: true, appStateVersion }
+        : { chatId: number, markedChatUnread: true, appStateVersion };
     } catch (error) {
       throw new InternalServerErrorException({
-        markedChatUnread: false,
-        message: ['An error occurred while marked unread the chat. Open a calling.', error.toString()],
+        [read ? 'markedChatRead' : 'markedChatUnread']: false,
+        message: [`An error occurred while marking the chat ${read ? 'read' : 'unread'}.`, error.toString()],
       });
     }
   }
