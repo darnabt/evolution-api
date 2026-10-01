@@ -97,15 +97,22 @@ import makeWASocket, {
   CacheStore,
   CatalogCollection,
   Chat,
+  chatModificationToAppPatch,
   ConnectionState,
   Contact,
+  decodePatches,
+  decodeSyncdSnapshot,
   decryptPollVote,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
   downloadMediaMessage,
+  encodeSyncdPatch,
+  extractSyncdPatches,
   generateWAMessageFromContent,
   getAggregateVotesInPollMessage,
+  getBinaryNodeChild,
+  getBinaryNodeChildren,
   GetCatalogOptions,
   getContentType,
   getDevice,
@@ -119,10 +126,12 @@ import makeWASocket, {
   MessageUpsertType,
   MessageUserReceiptUpdate,
   MiscMessageGenerationOptions,
+  newLTHashState,
   ParticipantAction,
   prepareWAMessageMedia,
   Product,
   proto,
+  S_WHATSAPP_NET,
   UserFacingSocketConfig,
   WABrowserDescription,
   WAMediaUpload,
@@ -3734,6 +3743,134 @@ export class BaileysStartupService extends ChannelStartupService {
     return lastMessage as unknown as LastMessage;
   }
 
+  // --- darnabt: checked app-state patches -----------------------------------------------
+  // Baileys' chatModify/appPatch sends the patch and never reads WhatsApp's per-collection
+  // answer, so a rejected patch (stale version, broken local state) came back as "success".
+  // These helpers send the same patch but (1) make sure the local collection state matches
+  // the server first, (2) read the server's reply, (3) retry once from a fresh server
+  // snapshot, and (4) throw when WhatsApp did not accept it.
+  private appStateRebuilt = new Set<string>();
+
+  private appStateReplyError(result: any, name: string): string | null {
+    const sync = getBinaryNodeChild(result, 'sync');
+    const collections = sync ? getBinaryNodeChildren(sync, 'collection') : [];
+    const collection = collections.find((c: any) => c?.attrs?.name === name) ?? collections[0];
+    if (!collection) return null;
+    const error = getBinaryNodeChild(collection, 'error');
+    if (collection.attrs?.type === 'error' || error) {
+      return `code=${error?.attrs?.code ?? '?'} text=${error?.attrs?.text ?? '?'} collection=${JSON.stringify(
+        collection.attrs,
+      )}`;
+    }
+    return null;
+  }
+
+  // Rebuild one collection's LTHash state from WhatsApp's own snapshot + patches, without
+  // firing events. REMOVE mutations whose SET we never saw are skipped instead of aborting.
+  private async rebuildAppStateFromServer(name: string, getKey: (id: string) => Promise<any>) {
+    const keys: any = (this.client as any).authState.keys;
+    let state: any = newLTHashState();
+    const NO_EVENTS = Number.MAX_SAFE_INTEGER;
+    let skippedRemoves = 0;
+    for (let round = 0; round < 50; round++) {
+      const result = await (this.client as any).query({
+        tag: 'iq',
+        attrs: { to: S_WHATSAPP_NET, xmlns: 'w:sync:app:state', type: 'set' },
+        content: [
+          {
+            tag: 'sync',
+            attrs: {},
+            content: [
+              {
+                tag: 'collection',
+                attrs: { name, version: state.version.toString(), return_snapshot: (!state.version).toString() },
+              },
+            ],
+          },
+        ],
+      });
+      const replyError = this.appStateReplyError(result, name);
+      if (replyError) throw new Error(`WhatsApp refused to send ${name} state: ${replyError}`);
+      const decoded: any = await extractSyncdPatches(result, {} as any);
+      const { patches = [], hasMorePatches = false, snapshot = undefined } = decoded[name] || {};
+      if (snapshot) {
+        try {
+          ({ state } = await decodeSyncdSnapshot(name as any, snapshot, getKey, NO_EVENTS, true));
+        } catch (error) {
+          this.logger.warn(`app-state ${name}: snapshot MAC check failed (${error}), using it unverified`);
+          ({ state } = await decodeSyncdSnapshot(name as any, snapshot, getKey, NO_EVENTS, false));
+        }
+      }
+      for (const patch of patches) {
+        const before = patch.mutations?.length ?? 0;
+        patch.mutations = (patch.mutations || []).filter((m: any) => {
+          if (m.operation !== proto.SyncdMutation.SyncdOperation.REMOVE) return true;
+          const indexMac = Buffer.from(m.record?.index?.blob || []).toString('base64');
+          return !!state.indexValueMap[indexMac];
+        });
+        skippedRemoves += before - patch.mutations.length;
+        ({ state } = await decodePatches(name as any, [patch], state, getKey, {} as any, NO_EVENTS, undefined, false));
+      }
+      if (!hasMorePatches) break;
+    }
+    await keys.set({ 'app-state-sync-version': { [name]: state } });
+    this.logger.warn(`app-state ${name}: rebuilt from server at v${state.version} (skipped ${skippedRemoves} orphan removes)`);
+    return state;
+  }
+
+  private async sendAppPatchChecked(patchCreate: any): Promise<number> {
+    const name: string = patchCreate.type;
+    const sock: any = this.client;
+    const keys: any = sock.authState.keys;
+    const myAppStateKeyId: string = sock.authState.creds.myAppStateKeyId;
+    if (!myAppStateKeyId) {
+      throw new Error('App state key not present on this linked device');
+    }
+    const getKey = async (id: string) => (await keys.get('app-state-sync-key', [id]))[id];
+
+    let lastError = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        // normal Baileys catch-up first, so new remote changes still fire chats.update
+        await sock.resyncAppState(['regular_low', 'regular_high', 'regular'], false);
+      } catch (error) {
+        this.logger.warn(`app-state resync before ${name} patch failed: ${error}`);
+      }
+      let state = (await keys.get('app-state-sync-version', [name]))[name];
+      if (!state || attempt > 1 || !this.appStateRebuilt.has(name)) {
+        state = await this.rebuildAppStateFromServer(name, getKey);
+        this.appStateRebuilt.add(name);
+      }
+      const { patch, state: next } = await encodeSyncdPatch(patchCreate, myAppStateKeyId, state, getKey);
+      const result = await sock.query({
+        tag: 'iq',
+        attrs: { to: S_WHATSAPP_NET, type: 'set', xmlns: 'w:sync:app:state' },
+        content: [
+          {
+            tag: 'sync',
+            attrs: {},
+            content: [
+              {
+                tag: 'collection',
+                attrs: { name, version: (next.version - 1).toString(), return_snapshot: 'false' },
+                content: [{ tag: 'patch', attrs: {}, content: proto.SyncdPatch.encode(patch).finish() }],
+              },
+            ],
+          },
+        ],
+      });
+      const replyError = this.appStateReplyError(result, name);
+      if (!replyError) {
+        await keys.set({ 'app-state-sync-version': { [name]: next } });
+        this.logger.warn(`app-state ${name}: patch ACCEPTED by WhatsApp at v${next.version}`);
+        return next.version;
+      }
+      lastError = replyError;
+      this.logger.warn(`app-state ${name}: patch REJECTED (attempt ${attempt}) at v${next.version - 1}: ${replyError}`);
+    }
+    throw new Error(`WhatsApp rejected the ${name} change: ${lastError}`);
+  }
+
   public async archiveChat(data: ArchiveChatDto) {
     try {
       let last_message = data.lastMessage;
@@ -3743,7 +3880,7 @@ export class BaileysStartupService extends ChannelStartupService {
         last_message = await this.getLastMessage(number);
       } else {
         last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid;
       }
 
@@ -3751,9 +3888,11 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException('Last message not found');
       }
 
-      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, createJid(number));
+      const appStateVersion = await this.sendAppPatchChecked(
+        chatModificationToAppPatch({ archive: data.archive, lastMessages: [last_message] } as any, createJid(number)),
+      );
 
-      return { chatId: number, archived: true };
+      return { chatId: number, archived: true, appStateVersion };
     } catch (error) {
       throw new InternalServerErrorException({
         archived: false,
@@ -3771,7 +3910,7 @@ export class BaileysStartupService extends ChannelStartupService {
         last_message = await this.getLastMessage(number);
       } else {
         last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid;
       }
 
@@ -3779,9 +3918,11 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException('Last message not found');
       }
 
-      await this.client.chatModify({ markRead: false, lastMessages: [last_message] }, createJid(number));
+      const appStateVersion = await this.sendAppPatchChecked(
+        chatModificationToAppPatch({ markRead: false, lastMessages: [last_message] } as any, createJid(number)),
+      );
 
-      return { chatId: number, markedChatUnread: true };
+      return { chatId: number, markedChatUnread: true, appStateVersion };
     } catch (error) {
       throw new InternalServerErrorException({
         markedChatUnread: false,
@@ -4289,13 +4430,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
     try {
       if (data.action === 'add') {
-        await this.client.addChatLabel(contact.jid, data.labelId);
+        await this.sendAppPatchChecked(
+          chatModificationToAppPatch({ addChatLabel: { labelId: data.labelId } } as any, contact.jid),
+        );
         await this.addLabel(data.labelId, this.instanceId, contact.jid);
 
         return { numberJid: contact.jid, labelId: data.labelId, add: true };
       }
       if (data.action === 'remove') {
-        await this.client.removeChatLabel(contact.jid, data.labelId);
+        await this.sendAppPatchChecked(
+          chatModificationToAppPatch({ removeChatLabel: { labelId: data.labelId } } as any, contact.jid),
+        );
         await this.removeLabel(data.labelId, this.instanceId, contact.jid);
 
         return { numberJid: contact.jid, labelId: data.labelId, remove: true };
