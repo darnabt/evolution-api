@@ -1010,6 +1010,32 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }
 
+        // darnabt 2026-10-01 — history keys carry the chat id exactly as the phone stores it,
+        // often only a @lid with no phone number. Live upserts carry remoteJidAlt/participantAlt;
+        // give history the same so a receiver can tell who the chat is. Source: this chunk's own
+        // conversations (Baileys maps chat.lidJid/pnJid onto the contacts), then Baileys' LID store.
+        const lidToPn = new Map<string, string>();
+        for (const c of contacts as any[]) {
+          const jids = [c?.id, c?.lid, c?.phoneNumber].filter((j) => typeof j === 'string');
+          const lid = jids.find((j) => j.endsWith('@lid'));
+          const pn = jids.find((j) => j.endsWith('@s.whatsapp.net'));
+          if (lid && pn) lidToPn.set(jidNormalizedUser(lid), jidNormalizedUser(pn));
+        }
+        const pnForLid = async (jid?: string | null): Promise<string | undefined> => {
+          if (!jid || !jid.endsWith('@lid')) return undefined;
+          const lid = jidNormalizedUser(jid);
+          if (lidToPn.has(lid)) return lidToPn.get(lid) || undefined;
+          let pn: string | undefined;
+          try {
+            const found = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+            if (found) pn = jidNormalizedUser(found);
+          } catch {
+            pn = undefined;
+          }
+          lidToPn.set(lid, pn ?? '');
+          return pn;
+        };
+
         const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
         const chatsRepository = new Set(
           (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
@@ -1068,6 +1094,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (messagesRepository?.has(m.key.id)) {
             continue;
+          }
+
+          const key = m.key as typeof m.key & { remoteJidAlt?: string; participantAlt?: string };
+          if (!key.remoteJidAlt) {
+            const pn = await pnForLid(key.remoteJid);
+            if (pn) key.remoteJidAlt = pn;
+          }
+          if (key.participant && !key.participantAlt) {
+            const pn = await pnForLid(key.participant);
+            if (pn) key.participantAlt = pn;
           }
 
           if (!m.pushName && !m.key.fromMe) {
