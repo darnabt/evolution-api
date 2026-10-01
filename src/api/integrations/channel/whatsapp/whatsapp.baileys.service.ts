@@ -4431,7 +4431,7 @@ export class BaileysStartupService extends ChannelStartupService {
           op,
           type: index[0],
           jid: index[1],
-          ...(m ? { read: !!m.read } : {}),
+          ...(m ? { read: !!m.read, rangeMessages: (m.messageRange?.messages || []).length } : {}),
           ...(value?.archiveChatAction ? { archived: !!value.archiveChatAction.archived } : {}),
           ...(value?.pinAction ? { pinned: !!value.pinAction.pinned } : {}),
           ts: num(value?.timestamp),
@@ -4518,12 +4518,25 @@ export class BaileysStartupService extends ChannelStartupService {
         if (type === 'markChatAsRead' && value?.markChatAsReadAction) {
           const a = value.markChatAsReadAction;
           const r = a.messageRange || {};
+          // darnabt: a chat can hold two records for one index (written under different app-state
+          // keys, the older one not yet retired) — the newest write is the chat's state.
+          const prevAt = chats[jid]?.readAt;
+          if (typeof prevAt === 'number' && typeof at === 'number' && prevAt > at) continue;
+          // the mark names the chat's last messages: their ids let the receiver find a @lid chat
+          // it has no LID for (it knows the messages).
+          const rangeIds = (Array.isArray(r.messages) ? r.messages : [])
+            .map((m: any) => m?.key?.id)
+            .filter((id: any) => typeof id === 'string' && id)
+            .slice(-5);
           Object.assign(chat(jid), {
             read: !!a.read,
             readAt: at,
             rangeLastTs: num(r.lastMessageTimestamp) || num(r.lastSystemMessageTimestamp) || null,
+            rangeIds,
           });
         } else if (type === 'archive' && value?.archiveChatAction) {
+          const prevAt = chats[jid]?.archivedAt;
+          if (typeof prevAt === 'number' && typeof at === 'number' && prevAt > at) continue;
           Object.assign(chat(jid), { archived: !!value.archiveChatAction.archived, archivedAt: at });
         } else if (type === 'pin_v1' && value?.pinAction) {
           Object.assign(chat(jid), { pinned: !!value.pinAction.pinned, pinnedAt: at });
