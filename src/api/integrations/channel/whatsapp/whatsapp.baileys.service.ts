@@ -91,6 +91,7 @@ import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-fil
 import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-redis-db';
 import axios from 'axios';
 import makeWASocket, {
+  aesDecrypt,
   AnyMessageContent,
   BufferedEventData,
   BufferJSON,
@@ -100,12 +101,11 @@ import makeWASocket, {
   chatModificationToAppPatch,
   ConnectionState,
   Contact,
-  decodePatches,
-  decodeSyncdSnapshot,
   decryptPollVote,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
+  downloadExternalPatch,
   downloadMediaMessage,
   encodeSyncdPatch,
   extractSyncdPatches,
@@ -117,16 +117,18 @@ import makeWASocket, {
   getContentType,
   getDevice,
   GroupMetadata,
+  hkdf,
+  hmacSign,
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
   isPnUser,
   jidNormalizedUser,
+  LT_HASH_ANTI_TAMPERING,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   MessageUserReceiptUpdate,
   MiscMessageGenerationOptions,
-  newLTHashState,
   ParticipantAction,
   prepareWAMessageMedia,
   Product,
@@ -3766,14 +3768,60 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Rebuild one collection's LTHash state from WhatsApp's own snapshot + patches, without
-  // firing events. REMOVE mutations whose SET we never saw are skipped instead of aborting.
+  // firing events and WITHOUT decrypting values: the LTHash only needs each record's index
+  // MAC and value MAC, so records encrypted with a key we hold wrongly ("bad decrypt" in
+  // Baileys' resync) no longer block it. REMOVEs whose SET we never saw are skipped.
+  // Then the result is checked against WhatsApp's own snapshot/patch MAC, and our own
+  // app-state key is checked against records it encrypted — if either fails we refuse to
+  // upload (an upload would be unreadable for the phone and WhatsApp Web).
   private async rebuildAppStateFromServer(name: string, getKey: (id: string) => Promise<any>) {
-    const keys: any = (this.client as any).authState.keys;
-    let state: any = newLTHashState();
-    const NO_EVENTS = Number.MAX_SAFE_INTEGER;
+    const sock: any = this.client;
+    const keys: any = sock.authState.keys;
+    const myKeyId: string = sock.authState.creds.myAppStateKeyId;
+    const keyStats: Record<string, { ok: number; bad: number; missing: number }> = {};
+    const derived: Record<string, any> = {};
+    const keysFor = async (b64: string) => {
+      if (!(b64 in derived)) {
+        const key = await getKey(b64);
+        derived[b64] = key?.keyData
+          ? await hkdf(Buffer.from(key.keyData), 160, { info: 'WhatsApp Mutation Keys' })
+          : null;
+      }
+      return derived[b64];
+    };
+    const sampleRecord = async (record: any) => {
+      const b64 = Buffer.from(record?.keyId?.id || []).toString('base64');
+      const st = (keyStats[b64] = keyStats[b64] || { ok: 0, bad: 0, missing: 0 });
+      if (st.ok + st.bad + st.missing >= 25) return;
+      const expanded = await keysFor(b64);
+      if (!expanded) {
+        st.missing++;
+        return;
+      }
+      try {
+        const blob = Buffer.from(record.value.blob);
+        aesDecrypt(blob.slice(0, -32), expanded.slice(32, 64));
+        st.ok++;
+      } catch {
+        st.bad++;
+      }
+    };
+    const macOf = async (hash: Buffer, version: number, keyIdBytes: any) => {
+      const expanded = await keysFor(Buffer.from(keyIdBytes || []).toString('base64'));
+      if (!expanded) return null;
+      const v = Buffer.alloc(8);
+      v.writeUInt32BE(version, 4);
+      return hmacSign(Buffer.concat([hash, v, Buffer.from(name, 'utf-8')]), expanded.slice(96, 128), 'sha256');
+    };
+
+    let version = 0;
+    let hash: Buffer = Buffer.alloc(128);
+    let indexValueMap: Record<string, { valueMac: Buffer }> = {};
     let skippedRemoves = 0;
+    let lastCheck: { mac: any; keyId: any; version: number } | null = null;
+
     for (let round = 0; round < 50; round++) {
-      const result = await (this.client as any).query({
+      const result = await sock.query({
         tag: 'iq',
         attrs: { to: S_WHATSAPP_NET, xmlns: 'w:sync:app:state', type: 'set' },
         content: [
@@ -3781,10 +3829,7 @@ export class BaileysStartupService extends ChannelStartupService {
             tag: 'sync',
             attrs: {},
             content: [
-              {
-                tag: 'collection',
-                attrs: { name, version: state.version.toString(), return_snapshot: (!state.version).toString() },
-              },
+              { tag: 'collection', attrs: { name, version: version.toString(), return_snapshot: (!version).toString() } },
             ],
           },
         ],
@@ -3794,27 +3839,75 @@ export class BaileysStartupService extends ChannelStartupService {
       const decoded: any = await extractSyncdPatches(result, {} as any);
       const { patches = [], hasMorePatches = false, snapshot = undefined } = decoded[name] || {};
       if (snapshot) {
-        try {
-          ({ state } = await decodeSyncdSnapshot(name as any, snapshot, getKey, NO_EVENTS, true));
-        } catch (error) {
-          this.logger.warn(`app-state ${name}: snapshot MAC check failed (${error}), using it unverified`);
-          ({ state } = await decodeSyncdSnapshot(name as any, snapshot, getKey, NO_EVENTS, false));
+        const adds: ArrayBuffer[] = [];
+        indexValueMap = {};
+        for (const record of snapshot.records || []) {
+          const valueMac = Buffer.from(record.value.blob).slice(-32);
+          indexValueMap[Buffer.from(record.index.blob).toString('base64')] = { valueMac };
+          adds.push(new Uint8Array(valueMac).buffer);
+          await sampleRecord(record);
         }
+        hash = Buffer.from(await LT_HASH_ANTI_TAMPERING.subtractThenAdd(new Uint8Array(128).buffer, adds, []));
+        version = Number(snapshot.version?.version || 0);
+        lastCheck = { mac: snapshot.mac, keyId: snapshot.keyId?.id, version };
       }
       for (const patch of patches) {
-        const before = patch.mutations?.length ?? 0;
-        patch.mutations = (patch.mutations || []).filter((m: any) => {
-          if (m.operation !== proto.SyncdMutation.SyncdOperation.REMOVE) return true;
-          const indexMac = Buffer.from(m.record?.index?.blob || []).toString('base64');
-          return !!state.indexValueMap[indexMac];
-        });
-        skippedRemoves += before - patch.mutations.length;
-        ({ state } = await decodePatches(name as any, [patch], state, getKey, {} as any, NO_EVENTS, undefined, false));
+        if (patch.externalMutations) {
+          const ext = await downloadExternalPatch(patch.externalMutations, {} as any);
+          patch.mutations = [...(patch.mutations || []), ...(ext.mutations || [])];
+        }
+        const adds: ArrayBuffer[] = [];
+        const subs: ArrayBuffer[] = [];
+        for (const m of patch.mutations || []) {
+          const record = m.record;
+          const indexB64 = Buffer.from(record.index.blob).toString('base64');
+          const valueMac = Buffer.from(record.value.blob).slice(-32);
+          const prev = indexValueMap[indexB64];
+          if (m.operation === proto.SyncdMutation.SyncdOperation.REMOVE) {
+            if (!prev) {
+              skippedRemoves++;
+              continue;
+            }
+            delete indexValueMap[indexB64];
+          } else {
+            adds.push(new Uint8Array(valueMac).buffer);
+            indexValueMap[indexB64] = { valueMac };
+            await sampleRecord(record);
+          }
+          if (prev) subs.push(new Uint8Array(prev.valueMac).buffer);
+        }
+        hash = Buffer.from(await LT_HASH_ANTI_TAMPERING.subtractThenAdd(new Uint8Array(hash).buffer, adds, subs));
+        version = Number(patch.version?.version || version + 1);
+        lastCheck = { mac: patch.snapshotMac, keyId: patch.keyId?.id, version };
       }
       if (!hasMorePatches) break;
     }
+
+    const state = { version, hash, indexValueMap };
+    let macResult = 'no snapshot/patch to check';
+    if (lastCheck?.mac) {
+      const computed = await macOf(hash, lastCheck.version, lastCheck.keyId);
+      macResult = !computed
+        ? 'check key missing'
+        : Buffer.compare(computed, Buffer.from(lastCheck.mac)) === 0
+          ? 'MATCH'
+          : 'MISMATCH';
+    }
+    this.logger.warn(
+      `app-state ${name}: rebuilt from server at v${version}; MAC check ${macResult}; skipped ${skippedRemoves} orphan removes; myAppStateKeyId=${myKeyId}; key decrypt sample ${JSON.stringify(
+        keyStats,
+      )}`,
+    );
+    const own = keyStats[myKeyId];
+    if (own && own.bad > 0 && own.ok === 0) {
+      throw new Error(
+        `this linked device's own app-state key (${myKeyId}) cannot decrypt ${name} records it should own — WhatsApp would not accept our change`,
+      );
+    }
+    if (macResult === 'MISMATCH') {
+      throw new Error(`rebuilt ${name} state does not match WhatsApp's MAC at v${version} — not uploading`);
+    }
     await keys.set({ 'app-state-sync-version': { [name]: state } });
-    this.logger.warn(`app-state ${name}: rebuilt from server at v${state.version} (skipped ${skippedRemoves} orphan removes)`);
     return state;
   }
 
