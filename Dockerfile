@@ -26,6 +26,9 @@ COPY ./Docker ./Docker
 
 RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
 
+# darnabt: keep the LID<->phone pairs Baileys rc.9 drops from history sync
+RUN node ./Docker/scripts/patch-baileys-history.js
+
 RUN ./Docker/scripts/generate_database.sh
 
 RUN npm run build

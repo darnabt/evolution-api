@@ -983,6 +983,7 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest,
       progress,
       syncType,
+      phoneNumberToLidMappings,
     }: {
       chats: Chat[];
       contacts: Contact[];
@@ -990,6 +991,8 @@ export class BaileysStartupService extends ChannelStartupService {
       isLatest?: boolean;
       progress?: number;
       syncType?: proto.HistorySync.HistorySyncType;
+      // darnabt: kept by Docker/scripts/patch-baileys-history.js (rc.9 drops it)
+      phoneNumberToLidMappings?: proto.IPhoneNumberToLIDMapping[];
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
@@ -1037,6 +1040,25 @@ export class BaileysStartupService extends ChannelStartupService {
           const pn = jids.find((j) => j.endsWith('@s.whatsapp.net'));
           if (lid && pn) lidToPn.set(jidNormalizedUser(lid), jidNormalizedUser(pn));
         }
+        // WhatsApp's own LID<->phone pairs for this history (often in a chunk with no messages):
+        // remember them in Baileys' LID store so later chunks and live messages resolve too.
+        const historyPairs: { lid: string; pn: string }[] = [];
+        for (const mp of phoneNumberToLidMappings ?? []) {
+          if (mp?.lidJid && mp?.pnJid) {
+            const lid = jidNormalizedUser(mp.lidJid.includes('@') ? mp.lidJid : `${mp.lidJid}@lid`);
+            const pn = jidNormalizedUser(mp.pnJid.includes('@') ? mp.pnJid : `${mp.pnJid}@s.whatsapp.net`);
+            lidToPn.set(lid, pn);
+            historyPairs.push({ lid, pn });
+          }
+        }
+        if (historyPairs.length) {
+          try {
+            await this.client.signalRepository.lidMapping.storeLIDPNMappings(historyPairs);
+          } catch (e) {
+            this.logger.warn(`history LID mappings not stored: ${(e as Error)?.message ?? e}`);
+          }
+        }
+        console.log(`history lid->pn: ${historyPairs.length} pairs from WhatsApp, ${lidToPn.size} known`);
         const pnForLid = async (jid?: string | null): Promise<string | undefined> => {
           if (!jid || !jid.endsWith('@lid')) return undefined;
           const lid = jidNormalizedUser(jid);
