@@ -2053,19 +2053,70 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['message-receipt.update']) {
               const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
+              // darnabt 2026-10-03: in a GROUP, Baileys emits a read receipt as message-receipt.update
+              // (never messages.update) — both when ANOTHER member reads one of our messages and when
+              // our own phone / WhatsApp Web reads the group ("read-self"). Stock Evolution only wrote
+              // its own DB and sent NO webhook, so a group read on the phone never reached the
+              // receiver (proved 2026-10-03 17:29:27Z, group 120363426353639064@g.us: Chat row went to
+              // 0, zero webhooks sent). It also treated another member's read as OUR read.
+              // Now: a receipt whose message ids are INBOUND messages (fromMe false) is our own read →
+              // update the DB as before AND forward it as messages.update status READ, fromMe false
+              // (the same shape a 1-to-1 read-self already has). Receipts on our own messages are left alone.
+              const reads = payload.filter(
+                (e) =>
+                  typeof e.key?.remoteJid === 'string' &&
+                  typeof e.key?.id === 'string' &&
+                  typeof e.receipt?.readTimestamp === 'number',
+              );
+              if (reads.length > 0) {
+                const ids = [...new Set(reads.map((e) => e.key.id as string))];
+                let inbound: { id: string; keyId: string; remoteJid: string; participant: string | null }[] = [];
+                try {
+                  inbound = (await this.prismaRepository.$queryRaw`
+                    SELECT "id", "key"->>'id' AS "keyId", "key"->>'remoteJid' AS "remoteJid",
+                           "key"->>'participant' AS "participant"
+                    FROM "Message"
+                    WHERE "instanceId" = ${this.instanceId}
+                    AND "key"->>'id' = ANY(${ids}::text[])
+                    AND ("key"->>'fromMe')::boolean = false
+                  `) as any[];
+                } catch (error) {
+                  this.logger.error(`message-receipt.update: inbound lookup failed: ${error?.toString()}`);
+                }
+                const inboundIds = new Set(inbound.map((m) => m.keyId));
+                const remotesJidMap: Record<string, number> = {};
+                for (const e of reads) {
+                  if (!inboundIds.has(e.key.id as string)) continue;
+                  const ts = e.receipt.readTimestamp as number;
+                  if (!remotesJidMap[e.key.remoteJid] || ts > remotesJidMap[e.key.remoteJid]) {
+                    remotesJidMap[e.key.remoteJid] = ts;
+                  }
+                }
 
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                await Promise.all(
+                  Object.keys(remotesJidMap).map(async (remoteJid) =>
+                    this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                  ),
+                );
+
+                if (inbound.length > 0) {
+                  this.logger.log(
+                    `message-receipt.update: own read of ${inbound.length} inbound message(s) in ${Object.keys(remotesJidMap).join(', ')} -> webhook`,
+                  );
+                  this.sendDataWebhook(
+                    Events.MESSAGES_UPDATE,
+                    inbound.map((m) => ({
+                      keyId: m.keyId,
+                      remoteJid: m.remoteJid,
+                      fromMe: false,
+                      participant: m.participant ?? undefined,
+                      status: 'READ',
+                      instanceId: this.instanceId,
+                      messageId: m.id,
+                    })),
+                  );
                 }
               }
-
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
             }
 
             if (events['presence.update']) {
