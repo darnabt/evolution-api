@@ -1441,7 +1441,9 @@ export class BaileysStartupService extends ChannelStartupService {
           const isVideo = received?.message?.videoMessage;
 
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
-            await this.client.readMessages([received.key]);
+            // darnabt 2026-10-03: 'read-self' only (own devices). Contacts never get a blue tick from this
+            // linked device, whatever the number's read-receipts privacy says.
+            await this.client.sendReceipts([received.key], 'read-self');
           }
 
           if (this.localSettings.readStatus && received.key.id === 'status@broadcast') {
@@ -3806,7 +3808,9 @@ export class BaileysStartupService extends ChannelStartupService {
           keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
         }
       });
-      await this.client.readMessages(keys);
+      // darnabt 2026-10-03: always 'read-self' (syncs the read to our own phone/Web, never a blue tick to the
+      // contact). Baileys' readMessages picks 'read' when read receipts are on — the owner never wants that.
+      await this.client.sendReceipts(keys, 'read-self');
       return { message: 'Read messages', read: 'success' };
     } catch (error) {
       throw new InternalServerErrorException('Read messages fail', error.toString());
