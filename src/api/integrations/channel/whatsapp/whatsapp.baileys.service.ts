@@ -4642,17 +4642,38 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException('Last message not found');
       }
 
+      // darnabt: same phone -> @lid swap as pinChat (WhatsApp keeps 1:1 chats under the LID); the
+      // message key is re-addressed to the same chat so the archive range matches. Body unchanged.
+      const { chatJid, lid } = await this.resolveChatLid(createJid(data.chat || number), 'archive chat');
+      const lastMsg: any = { ...last_message, key: { ...last_message.key, remoteJid: chatJid } };
+
       const appStateVersion = await this.sendAppPatchChecked(
-        chatModificationToAppPatch({ archive: data.archive, lastMessages: [last_message] } as any, createJid(number)),
+        chatModificationToAppPatch({ archive: data.archive, lastMessages: [lastMsg] } as any, chatJid),
       );
 
-      return { chatId: number, archived: true, appStateVersion };
+      return { chatId: chatJid, archived: true, appStateVersion, ...(lid ? { lid } : {}) };
     } catch (error) {
       throw new InternalServerErrorException({
         archived: false,
         message: ['An error occurred while archiving the chat. Open a calling.', error.toString()],
       });
     }
+  }
+
+  // darnabt: phone JID -> the chat's @lid (Baileys store, then one USync query; no message sent).
+  private async resolveChatLid(jid: string, what: string): Promise<{ chatJid: string; lid: string | null }> {
+    let chatJid = jid;
+    let lid: string | null = null;
+    if (chatJid.endsWith('@s.whatsapp.net')) {
+      try {
+        const found = await this.client.signalRepository.lidMapping.getLIDForPN(chatJid);
+        if (found) lid = jidNormalizedUser(found);
+      } catch (e) {
+        this.logger.warn(`${what}: LID lookup failed for ${chatJid}: ${e}`);
+      }
+      if (lid) chatJid = lid;
+    }
+    return { chatJid, lid };
   }
 
   public async markChatUnread(data: MarkChatUnreadDto) {
@@ -4739,17 +4760,7 @@ export class BaileysStartupService extends ChannelStartupService {
    * caller (WhatsApp itself would accept a 4th patch and the phone would show it inconsistently).
    */
   public async pinChat(data: PinChatDto) {
-    let chatJid = createJid(data.chat);
-    let lid: string | null = null;
-    if (chatJid.endsWith('@s.whatsapp.net')) {
-      try {
-        const found = await this.client.signalRepository.lidMapping.getLIDForPN(chatJid);
-        if (found) lid = jidNormalizedUser(found);
-      } catch (e) {
-        this.logger.warn(`pin chat: LID lookup failed for ${chatJid}: ${e}`);
-      }
-      if (lid) chatJid = lid;
-    }
+    const { chatJid, lid } = await this.resolveChatLid(createJid(data.chat), 'pin chat');
     try {
       const appStateVersion = await this.sendAppPatchChecked(
         chatModificationToAppPatch({ pin: !!data.pin } as any, chatJid),
