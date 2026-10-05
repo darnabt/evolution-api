@@ -4,6 +4,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  PinMessageDto,
   getBase64FromMediaMessageDto,
   LastMessage,
   MarkChatUnreadDto,
@@ -4724,6 +4725,53 @@ export class BaileysStartupService extends ChannelStartupService {
       throw new InternalServerErrorException({
         [read ? 'markedChatRead' : 'markedChatUnread']: false,
         message: [`An error occurred while marking the chat ${read ? 'read' : 'unread'}.`, error.toString()],
+      });
+    }
+  }
+
+  /**
+   * darnabt: pin / unpin ONE message (WhatsApp's own "Pin", shared with the phone and the other side).
+   * Baileys: sendMessage(jid, { pin: key, type: 1 pin | 2 unpin, time: seconds }) -> a pinInChatMessage.
+   * In a group whose settings are admins-only ("Edit group settings"), only an admin may pin: checked here
+   * against fresh group metadata, because WhatsApp drops a refused pin silently (sendMessage still resolves).
+   */
+  public async pinMessage(data: PinMessageDto) {
+    const jid = data.remoteJid;
+    if (isJidGroup(jid)) {
+      let meta: GroupMetadata | null = null;
+      try {
+        meta = await this.client.groupMetadata(jid);
+      } catch {
+        meta = null;
+      }
+      if (meta?.restrict) {
+        const me = [this.client.user?.id, (this.client.user as any)?.lid]
+          .filter((x): x is string => typeof x === 'string' && !!x)
+          .map((x) => jidNormalizedUser(x));
+        const self = (meta.participants ?? []).find((p: any) =>
+          [p?.id, p?.phoneNumber, p?.lid, p?.jid]
+            .filter((x): x is string => typeof x === 'string' && !!x)
+            .some((x) => me.includes(jidNormalizedUser(x))),
+        );
+        if (!self || (self.admin !== 'admin' && self.admin !== 'superadmin')) {
+          throw new BadRequestException({ pinned: false, reason: 'only-admins', message: 'Only group admins can pin here' });
+        }
+      }
+    }
+    const key = {
+      id: data.key.id,
+      fromMe: !!data.key.fromMe,
+      remoteJid: data.key.remoteJid || jid,
+      ...(data.key.participant ? { participant: data.key.participant } : {}),
+    };
+    try {
+      const time = data.pin ? data.duration || 604800 : undefined;
+      const sent = await this.client.sendMessage(jid, { pin: key, type: data.pin ? 1 : 2, ...(time ? { time } : {}) } as any);
+      return { pinned: data.pin, key: sent?.key ?? null, messageTimestamp: sent?.messageTimestamp ?? null };
+    } catch (error) {
+      throw new InternalServerErrorException({
+        pinned: false,
+        message: ['An error occurred while pinning the message.', error?.toString?.() ?? String(error)],
       });
     }
   }

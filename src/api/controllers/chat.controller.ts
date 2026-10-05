@@ -5,6 +5,7 @@ import {
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
+  PinMessageDto,
   PrivacySettingDto,
   ProfileNameDto,
   ProfilePictureDto,
@@ -65,6 +66,14 @@ export class ChatController {
 
   public async deleteMessage({ instanceName }: InstanceDto, data: DeleteMessage) {
     return await this.waMonitor.waInstances[instanceName].deleteMessage(data);
+  }
+
+  public async pinMessage({ instanceName }: InstanceDto, data: PinMessageDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.pinMessage !== 'function') {
+      throw new BadRequestException('Only Baileys instances can pin messages');
+    }
+    return await instance.pinMessage(data);
   }
 
   public async fetchProfilePicture({ instanceName }: InstanceDto, data: NumberDto) {

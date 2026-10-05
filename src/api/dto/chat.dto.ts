@@ -101,6 +101,15 @@ export class DeleteMessage {
   remoteJid: string;
   participant?: string;
 }
+
+// darnabt: pin / unpin ONE message in a chat (WhatsApp's "Pin" on a message, shared with the phone).
+export class PinMessageDto {
+  remoteJid: string;
+  key: { id: string; fromMe: boolean; remoteJid?: string; participant?: string };
+  pin: boolean;
+  /** seconds the pin lasts: 86400 (24 h) | 604800 (7 days) | 2592000 (30 days); ignored on unpin */
+  duration?: number;
+}
 export class Options {
   delay?: number;
   presence?: WAPresence;

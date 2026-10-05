@@ -141,6 +141,29 @@ export const deleteMessageSchema: JSONSchema7 = {
   ...isNotEmpty('id', 'remoteJid', 'participant'),
 };
 
+export const pinMessageSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    remoteJid: { type: 'string' },
+    key: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        fromMe: { type: 'boolean', enum: [true, false] },
+        remoteJid: { type: 'string' },
+        participant: { type: 'string' },
+      },
+      required: ['id', 'fromMe'],
+      ...isNotEmpty('id'),
+    },
+    pin: { type: 'boolean', enum: [true, false] },
+    duration: { type: 'integer', enum: [86400, 604800, 2592000] },
+  },
+  required: ['remoteJid', 'key', 'pin'],
+  ...isNotEmpty('remoteJid'),
+};
+
 export const profilePictureSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
