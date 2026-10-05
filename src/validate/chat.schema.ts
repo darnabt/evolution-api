@@ -141,6 +141,17 @@ export const deleteMessageSchema: JSONSchema7 = {
   ...isNotEmpty('id', 'remoteJid', 'participant'),
 };
 
+export const pinChatSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    chat: { type: 'string' },
+    pin: { type: 'boolean', enum: [true, false] },
+  },
+  required: ['chat', 'pin'],
+  ...isNotEmpty('chat'),
+};
+
 export const pinMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

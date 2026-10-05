@@ -4,6 +4,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  PinChatDto,
   PinMessageDto,
   getBase64FromMediaMessageDto,
   LastMessage,
@@ -4725,6 +4726,40 @@ export class BaileysStartupService extends ChannelStartupService {
       throw new InternalServerErrorException({
         [read ? 'markedChatRead' : 'markedChatUnread']: false,
         message: [`An error occurred while marking the chat ${read ? 'read' : 'unread'}.`, error.toString()],
+      });
+    }
+  }
+
+  /**
+   * darnabt: pin / unpin a whole CHAT in the chat list (WhatsApp's chat pin, synced to the phone + Web).
+   * Baileys: chatModify({ pin }) -> app-state `pin_v1` in regular_low, sent through the checked upload
+   * (MAC verified against the server; a refused upload is a 500, never fake success).
+   * 1:1 chats live under their @lid on WhatsApp: a phone JID is swapped for its LID (store, then one
+   * USync lookup — no message sent) and the answer names it. WhatsApp's 3-pin cap is enforced by the
+   * caller (WhatsApp itself would accept a 4th patch and the phone would show it inconsistently).
+   */
+  public async pinChat(data: PinChatDto) {
+    let chatJid = createJid(data.chat);
+    let lid: string | null = null;
+    if (chatJid.endsWith('@s.whatsapp.net')) {
+      try {
+        const found = await this.client.signalRepository.lidMapping.getLIDForPN(chatJid);
+        if (found) lid = jidNormalizedUser(found);
+      } catch (e) {
+        this.logger.warn(`pin chat: LID lookup failed for ${chatJid}: ${e}`);
+      }
+      if (lid) chatJid = lid;
+    }
+    try {
+      const appStateVersion = await this.sendAppPatchChecked(
+        chatModificationToAppPatch({ pin: !!data.pin } as any, chatJid),
+      );
+      this.logger.info(`pin chat: ${data.pin ? 'pinned' : 'unpinned'} ${chatJid} -> v${appStateVersion}`);
+      return { chatId: chatJid, pinned: !!data.pin, appStateVersion, ...(lid ? { lid } : {}) };
+    } catch (error) {
+      throw new InternalServerErrorException({
+        pinned: false,
+        message: [`An error occurred while ${data.pin ? 'pinning' : 'unpinning'} the chat.`, error?.toString?.() ?? String(error)],
       });
     }
   }

@@ -6,6 +6,7 @@ import {
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
+  PinChatDto,
   PinMessageDto,
   PrivacySettingDto,
   ProfileNameDto,
@@ -28,6 +29,7 @@ import {
   markChatUnreadSchema,
   messageUpSchema,
   messageValidateSchema,
+  pinChatSchema,
   pinMessageSchema,
   presenceSchema,
   privacySettingsSchema,
@@ -132,6 +134,17 @@ export class ChatRouter extends RouterBroker {
           schema: deleteMessageSchema,
           ClassRef: DeleteMessage,
           execute: (instance, data) => chatController.deleteMessage(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
+      })
+      // darnabt: pin / unpin a whole chat in the chat list (app-state pin_v1, shared with the phone)
+      .post(this.routerPath('pinChat'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<PinChatDto>({
+          request: req,
+          schema: pinChatSchema,
+          ClassRef: PinChatDto,
+          execute: (instance, data) => chatController.pinChat(instance, data),
         });
 
         return res.status(HttpStatus.CREATED).json(response);
