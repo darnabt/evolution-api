@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { configService, Kafka, Log } from '@config/env.config';
@@ -326,7 +327,7 @@ export class KafkaController extends EventController implements EventControllerI
               local: `${origin}.sendData-Kafka`,
               ...message,
             };
-            this.logger.log(logData);
+            this.logger.log(redactSecrets(logData));
           }
 
           break;
@@ -372,7 +373,7 @@ export class KafkaController extends EventController implements EventControllerI
               local: `${origin}.sendData-Kafka-Global`,
               ...message,
             };
-            this.logger.log(logData);
+            this.logger.log(redactSecrets(logData));
           }
 
           break;

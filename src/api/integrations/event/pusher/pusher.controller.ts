@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import { EventDto } from '@api/integrations/event/event.dto';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -164,11 +165,11 @@ export class PusherController extends EventController implements EventController
       const pusherLocalEvents = instance.events;
       if (Array.isArray(pusherLocalEvents) && pusherLocalEvents.includes(we)) {
         if (enabledLog) {
-          this.logger.log({
+          this.logger.log(redactSecrets({
             local: `${origin}.sendData-Pusher`,
             appId: instance.appId,
             ...pusherData,
-          });
+          }));
         }
         try {
           const pusher = this.pusherClients[instanceName];
@@ -190,11 +191,11 @@ export class PusherController extends EventController implements EventController
       const globalEvents = this.pusherConfig.EVENTS;
       if (globalEvents[we]) {
         if (enabledLog) {
-          this.logger.log({
+          this.logger.log(redactSecrets({
             local: `${origin}.sendData-Pusher-Global`,
             appId: this.pusherConfig.GLOBAL?.APP_ID,
             ...pusherData,
-          });
+          }));
         }
         try {
           if (this.globalPusherClient) {

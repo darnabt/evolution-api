@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -198,7 +199,7 @@ export class SqsController extends EventController implements EventControllerInt
               ...message,
             };
 
-            this.logger.log(logData);
+            this.logger.log(redactSecrets(logData));
           }
         });
       }

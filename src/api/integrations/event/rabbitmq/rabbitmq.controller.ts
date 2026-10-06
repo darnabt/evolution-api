@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { configService, Log, Rabbitmq } from '@config/env.config';
@@ -279,7 +280,7 @@ export class RabbitmqController extends EventController implements EventControll
                 ...message,
               };
 
-              this.logger.log(logData);
+              this.logger.log(redactSecrets(logData));
             }
 
             break;
@@ -332,7 +333,7 @@ export class RabbitmqController extends EventController implements EventControll
               ...message,
             };
 
-            this.logger.log(logData);
+            this.logger.log(redactSecrets(logData));
           }
 
           break;

@@ -1,3 +1,4 @@
+import { redactReplacer } from '@utils/redact';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
@@ -665,7 +666,7 @@ export class ChatwootService {
         }
       }
       this.logger.verbose(`--- Start createConversation ---`);
-      this.logger.verbose(`Instance: ${JSON.stringify(instance)}`);
+      this.logger.verbose(`Instance: ${JSON.stringify(instance, redactReplacer)}`);
 
       // If it already exists in the cache, return conversationId
       if (await this.cache.has(cacheKey)) {
@@ -1994,7 +1995,7 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
-        this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
+        this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, redactReplacer, 2)}`);
         if (body.key.remoteJid === 'status@broadcast') {
           return;
         }

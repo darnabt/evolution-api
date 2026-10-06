@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Auth, configService, Cors, Log, Websocket } from '@config/env.config';
@@ -145,7 +146,7 @@ export class WebsocketController extends EventController implements EventControl
       this.socket.emit(event, message);
 
       if (logEnabled) {
-        this.logger.log({ local: `${origin}.sendData-WebsocketGlobal`, ...message });
+        this.logger.log(redactSecrets({ local: `${origin}.sendData-WebsocketGlobal`, ...message }));
       }
     }
 
@@ -160,7 +161,7 @@ export class WebsocketController extends EventController implements EventControl
         this.socket.of(`/${instanceName}`).emit(event, message);
 
         if (logEnabled) {
-          this.logger.log({ local: `${origin}.sendData-Websocket`, ...message });
+          this.logger.log(redactSecrets({ local: `${origin}.sendData-Websocket`, ...message }));
         }
       }
     } catch (err) {

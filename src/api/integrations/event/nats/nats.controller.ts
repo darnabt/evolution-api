@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { configService, Log, Nats } from '@config/env.config';
@@ -89,7 +90,7 @@ export class NatsController extends EventController implements EventControllerIn
               local: `${origin}.sendData-NATS`,
               ...message,
             };
-            this.logger.log(logData);
+            this.logger.log(redactSecrets(logData));
           }
         } catch (error) {
           this.logger.error(`Failed to publish to NATS (instance): ${error}`);
@@ -109,7 +110,7 @@ export class NatsController extends EventController implements EventControllerIn
             local: `${origin}.sendData-NATS-Global`,
             ...message,
           };
-          this.logger.log(logData);
+          this.logger.log(redactSecrets(logData));
         }
       } catch (error) {
         this.logger.error(`Failed to publish to NATS (global): ${error}`);

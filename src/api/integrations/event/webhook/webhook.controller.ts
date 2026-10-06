@@ -1,3 +1,4 @@
+import { redactSecrets } from '@utils/redact';
 import { EventDto } from '@api/integrations/event/event.dto';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -119,7 +120,7 @@ export class WebhookController extends EventController implements EventControlle
             ...webhookData,
           };
 
-          this.logger.log(logData);
+          this.logger.log(redactSecrets(logData));
         }
 
         try {
@@ -164,7 +165,7 @@ export class WebhookController extends EventController implements EventControlle
             ...webhookData,
           };
 
-          this.logger.log(logData);
+          this.logger.log(redactSecrets(logData));
         }
 
         try {
