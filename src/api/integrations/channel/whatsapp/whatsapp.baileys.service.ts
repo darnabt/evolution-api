@@ -3901,6 +3901,8 @@ export class BaileysStartupService extends ChannelStartupService {
   // the server first, (2) read the server's reply, (3) retry once from a fresh server
   // snapshot, and (4) throw when WhatsApp did not accept it.
   private appStateRebuilt = new Set<string>();
+  // collections whose last rebuild never matched WhatsApp's MAC but was uploaded anyway (all records clean)
+  private appStateMacForced = new Set<string>();
 
   // darnabt 2026-10-01: Baileys drops a collection's state (sets it to null) whenever an incoming
   // app-state sync fails ("bad decrypt", "Invalid patch mac", missing key) and then simply gives
@@ -4145,10 +4147,19 @@ export class BaileysStartupService extends ChannelStartupService {
         `this linked device's own app-state key (${myKeyId}) cannot decrypt ${name} records it should own — WhatsApp would not accept our change`,
       );
     }
-    if (macResult === 'MISMATCH' && !(macMatched.length && skippedRemoves === 0)) {
+    this.appStateMacForced.delete(name);
+    // darnabt 2026-10-07 (owner: "send anyway"): WhatsApp's own stored regular_low snapshot can carry a MAC
+    // that never matches any honest rebuild. When EVERY sampled record decrypted, no key is missing and no
+    // REMOVE was orphaned, the rebuilt hash is the true one — upload anyway, loudly. Any other case still refuses.
+    const sampled = Object.values(keyStats);
+    const allClean =
+      sampled.length > 0 && sampled.every((s) => s.bad === 0 && s.missing === 0) && skippedRemoves === 0;
+    if (macResult === 'MISMATCH' && !macMatched.length && allClean) {
+      this.logger.warn(`${name} MAC mismatch accepted (all records clean) — uploading (v${version})`);
+      this.appStateMacForced.add(name);
+    } else if (macResult === 'MISMATCH' && !(macMatched.length && skippedRemoves === 0)) {
       throw new Error(`rebuilt ${name} state does not match WhatsApp's MAC at v${version} — not uploading`);
-    }
-    if (macResult === 'MISMATCH') {
+    } else if (macResult === 'MISMATCH') {
       this.logger.warn(
         `app-state ${name}: last MAC (v${version}) came from a device with a broken state; our rebuild matched v${
           macMatched[macMatched.length - 1]
@@ -4220,15 +4231,67 @@ export class BaileysStartupService extends ChannelStartupService {
         ],
       });
       const replyError = this.appStateReplyError(result, name);
+      const forced = this.appStateMacForced.has(name);
       if (!replyError) {
         await keys.set({ 'app-state-sync-version': { [name]: next } });
-        this.logger.warn(`app-state ${name}: patch ACCEPTED by WhatsApp at v${next.version}`);
+        this.logger.warn(`app-state ${name}: patch ACCEPTED by WhatsApp at v${next.version}${forced ? ' (MAC-mismatch upload)' : ''}`);
+        if (forced) {
+          const landed = await this.appPatchLanded(name, next.version, patch).catch((e) => `check failed: ${e}`);
+          if (landed !== true) {
+            this.logger.error(
+              `app-state ${name}: MAC-mismatch upload v${next.version} NOT found on WhatsApp's next sync (${landed}) — not retrying this change`,
+            );
+            throw new Error(`WhatsApp did not keep the ${name} change (MAC-mismatch upload): ${landed}`);
+          }
+          this.logger.warn(`app-state ${name}: MAC-mismatch upload v${next.version} confirmed on WhatsApp's next sync`);
+        }
         return next.version;
+      }
+      if (forced) {
+        this.logger.error(
+          `app-state ${name}: MAC-mismatch upload REJECTED by WhatsApp at v${next.version - 1}: ${replyError} — not retrying this change`,
+        );
+        throw new Error(`WhatsApp rejected the ${name} change (MAC-mismatch upload): ${replyError}`);
       }
       lastError = replyError;
       this.logger.warn(`app-state ${name}: patch REJECTED (attempt ${attempt}) at v${next.version - 1}: ${replyError}`);
     }
     throw new Error(`WhatsApp rejected the ${name} change: ${lastError}`);
+  }
+
+  // After a MAC-mismatch upload: read the collection back from the version before ours and check that
+  // WhatsApp now holds a patch carrying our mutation (same value MAC). true, or a plain reason.
+  private async appPatchLanded(name: string, ourVersion: number, ourPatch: any): Promise<true | string> {
+    const sock: any = this.client;
+    const ours = new Set<string>(
+      (ourPatch?.mutations || []).map((m: any) => Buffer.from(m.record.value.blob).slice(-32).toString('base64')),
+    );
+    if (!ours.size) return 'our patch had no mutations';
+    const result = await sock.query({
+      tag: 'iq',
+      attrs: { to: S_WHATSAPP_NET, xmlns: 'w:sync:app:state', type: 'set' },
+      content: [
+        {
+          tag: 'sync',
+          attrs: {},
+          content: [{ tag: 'collection', attrs: { name, version: (ourVersion - 1).toString(), return_snapshot: 'false' } }],
+        },
+      ],
+    });
+    const replyError = this.appStateReplyError(result, name);
+    if (replyError) return `WhatsApp refused the read-back: ${replyError}`;
+    const decoded: any = await extractSyncdPatches(result, {} as any);
+    const { patches = [] } = decoded[name] || {};
+    for (const patch of patches) {
+      if (patch.externalMutations) {
+        const ext = await downloadExternalPatch(patch.externalMutations, {} as any);
+        patch.mutations = [...(patch.mutations || []), ...(ext.mutations || [])];
+      }
+      for (const m of patch.mutations || []) {
+        if (ours.has(Buffer.from(m.record.value.blob).slice(-32).toString('base64'))) return true;
+      }
+    }
+    return `no patch after v${ourVersion - 1} carries our change (${patches.length} patch(es) returned)`;
   }
 
   // Read one collection from WhatsApp's server WITHOUT decrypting or changing local state:
