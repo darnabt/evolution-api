@@ -2112,6 +2112,9 @@ export class BaileysStartupService extends ChannelStartupService {
                       remoteJid: m.remoteJid,
                       fromMe: false,
                       participant: m.participant ?? undefined,
+                      // darnabt 2026-11-08 (K44 X5): WhatsApp's own read time, so Nawah clears the chat up to it
+                      // even when the read names a reaction / edit Nawah does not store as a message row.
+                      readTimestamp: remotesJidMap[m.remoteJid],
                       status: 'READ',
                       instanceId: this.instanceId,
                       messageId: m.id,
@@ -3858,7 +3861,14 @@ export class BaileysStartupService extends ChannelStartupService {
       const keys: proto.IMessageKey[] = [];
       data.readMessages.forEach((read) => {
         if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
-          keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
+          // darnabt 2026-11-08 (K44 X4): keep a group message's sender; WhatsApp ignores a group receipt without it,
+          // so a group read in Nawah never cleared the phone.
+          keys.push({
+            remoteJid: read.remoteJid,
+            fromMe: read.fromMe,
+            id: read.id,
+            ...(isJidGroup(read.remoteJid) && read.participant ? { participant: read.participant } : {}),
+          });
         }
       });
       // darnabt 2026-10-03: always 'read-self' (syncs the read to our own phone/Web, never a blue tick to the

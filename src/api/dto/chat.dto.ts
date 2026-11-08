@@ -65,6 +65,8 @@ class Key {
   id: string;
   fromMe: boolean;
   remoteJid: string;
+  // darnabt 2026-11-08: a group message's sender — a group read receipt without it is dropped by WhatsApp
+  participant?: string;
 }
 export class ReadMessageDto {
   readMessages: Key[];
