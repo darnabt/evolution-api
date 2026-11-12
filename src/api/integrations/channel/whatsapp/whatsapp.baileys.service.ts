@@ -237,6 +237,10 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+// Last full label app-state resync per instance (process-local; first connect after start always runs).
+const labelResyncAt = new Map<string, number>();
+const LABEL_RESYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -440,6 +444,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      {
+        const err = lastDisconnect?.error as any;
+        const data = err?.data;
+        const tag = data?.tag ? ` tag=${data.tag}` : '';
+        const attrs = data?.attrs ? ` attrs=${JSON.stringify(data.attrs)}` : '';
+        this.logger.warn(
+          `connection closed: code=${statusCode} msg=${err?.message ?? 'n/a'}${tag}${attrs} — ${
+            shouldReconnect ? 'reconnecting' : 'not reconnecting'
+          }`,
+        );
+      }
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
@@ -528,17 +543,26 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       // Resync all app state patches so labeled chats populate Chat.labels in DB
-      setTimeout(async () => {
-        try {
-          await (this.client as any).resyncAppState(
-            ['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'],
-            false,
-          );
-          this.logger.info('Label app state resync completed');
-        } catch (error) {
-          this.logger.warn('Failed to resync label app state: ' + error);
-        }
-      }, 8000);
+      // Throttled: a full resync re-emits every contact (thousands of webhooks/DB writes), so at most once per 6 h per instance.
+      const lastResyncAt = labelResyncAt.get(this.instance.name);
+      if (lastResyncAt && Date.now() - lastResyncAt < LABEL_RESYNC_INTERVAL_MS) {
+        this.logger.info(
+          `Label app state resync skipped (last ${Math.round((Date.now() - lastResyncAt) / 60000)} min ago)`,
+        );
+      } else {
+        labelResyncAt.set(this.instance.name, Date.now());
+        setTimeout(async () => {
+          try {
+            await (this.client as any).resyncAppState(
+              ['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'],
+              false,
+            );
+            this.logger.info('Label app state resync completed');
+          } catch (error) {
+            this.logger.warn('Failed to resync label app state: ' + error);
+          }
+        }, 8000);
+      }
     }
 
     if (connection === 'connecting') {
