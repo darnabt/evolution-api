@@ -1484,6 +1484,7 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw;
+            this.eventBatchStep = 'messages.upsert:db';
             const msg = await this.prismaRepository.message.create({ data: messageData });
 
             const { remoteJid } = received.key;
@@ -1611,6 +1612,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
+          this.eventBatchStep = 'messages.upsert:chatbot';
           await chatbotController.emit({
             instance: { instanceName: this.instance.name, instanceId: this.instanceId },
             remoteJid: messageRaw.key.remoteJid,
@@ -1618,6 +1620,7 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
+          this.eventBatchStep = 'messages.upsert:contact';
           const contact = await this.prismaRepository.contact.findFirst({
             where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
           });
@@ -2003,10 +2006,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private eventHandler() {
     this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+      const work = async () => {
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
+            this.eventBatchStep = 'findSettings';
             const settings = await this.findSettings();
 
             if (events.call) {
@@ -2037,11 +2041,13 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['messaging-history.set']) {
+              this.eventBatchStep = 'messaging-history.set';
               const payload = events['messaging-history.set'];
               await this.messageHandle['messaging-history.set'](payload);
             }
 
             if (events['messages.upsert']) {
+              this.eventBatchStep = 'messages.upsert';
               const payload = events['messages.upsert'];
 
               // this.messageProcessor.processMessage(payload, settings);
@@ -2049,11 +2055,13 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['messages.update']) {
+              this.eventBatchStep = 'messages.update';
               const payload = events['messages.update'];
               await this.messageHandle['messages.update'](payload, settings);
             }
 
             if (events['message-receipt.update']) {
+              this.eventBatchStep = 'message-receipt.update';
               const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
               // darnabt 2026-10-03: in a GROUP, Baileys emits a read receipt as message-receipt.update
               // (never messages.update) — both when ANOTHER member reads one of our messages and when
@@ -2188,8 +2196,70 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (error) {
           this.logger.error(error);
         }
-      });
+      };
+      this.eventProcessingQueue = this.eventProcessingQueue.then(() => this.runEventBatch(Object.keys(events), work));
     });
+  }
+
+  /**
+   * darnabt 2026-11-12 (the "deaf" number, 11-10 / 11-11 / 11-12): every Baileys event batch runs in ONE serial
+   * promise chain. One await that never ends (a slow WhatsApp query, a stalled download, a DB call while Postgres
+   * restarts) froze the chain: the number stayed "open" and could send, but no message, tick or read was processed
+   * again until a restart — and a restart threw the queued events away. Now a batch may take at most
+   * EVENT_BATCH_LIMIT_MS (history sync: EVENT_HISTORY_LIMIT_MS); after that the chain moves on (the slow batch keeps
+   * running on its own) and the log names the batch and the step it was on.
+   */
+  private eventBatchStep = '';
+  private eventBatchStartedAt = 0;
+  private static readonly EVENT_BATCH_LIMIT_MS = Number.parseInt(process.env?.EVENT_BATCH_LIMIT_MS) || 45_000;
+  private static readonly EVENT_HISTORY_LIMIT_MS = Number.parseInt(process.env?.EVENT_HISTORY_LIMIT_MS) || 300_000;
+
+  private async runEventBatch(names: string[], work: () => Promise<void>): Promise<void> {
+    const started = Date.now();
+    this.eventBatchStartedAt = started;
+    this.eventBatchStep = 'start';
+    const limit = names.includes('messaging-history.set')
+      ? BaileysStartupService.EVENT_HISTORY_LIMIT_MS
+      : BaileysStartupService.EVENT_BATCH_LIMIT_MS;
+    const label = names.join(',');
+    const slow = setInterval(() => {
+      this.logger.warn(
+        `event batch slow ${Math.round((Date.now() - started) / 1000)}s: [${label}] step=${this.eventBatchStep}`,
+      );
+    }, 15_000);
+    let timer: NodeJS.Timeout | undefined;
+    const done = work().catch((error) => this.logger.error(`event batch failed [${label}]: ${error}`));
+    const cut = new Promise<'cut'>((resolve) => {
+      timer = setTimeout(() => resolve('cut'), limit);
+    });
+    try {
+      const r = await Promise.race([done.then(() => 'done' as const), cut]);
+      if (r === 'cut') {
+        this.logger.error(
+          `event batch STUCK over ${Math.round(limit / 1000)}s, queue moves on: [${label}] step=${this.eventBatchStep}`,
+        );
+      } else if (Date.now() - started > 5_000) {
+        this.logger.warn(`event batch took ${Math.round((Date.now() - started) / 1000)}s: [${label}]`);
+      }
+    } finally {
+      clearInterval(slow);
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** a WhatsApp query that may never answer is capped; null when it did not answer in time */
+  private async withTimeout<T>(p: Promise<T>, ms: number): Promise<T | null> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
@@ -2226,7 +2296,8 @@ export class BaileysStartupService extends ChannelStartupService {
     const jid = createJid(number);
 
     try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
+      // darnabt 2026-11-12: capped — it runs inside the serial event queue for every inbound message
+      const profilePictureUrl = await this.withTimeout(this.client.profilePictureUrl(jid, 'image'), 8_000);
 
       return { wuid: jid, profilePictureUrl };
     } catch {
