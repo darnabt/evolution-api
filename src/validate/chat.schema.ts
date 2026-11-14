@@ -141,6 +141,15 @@ export const deleteMessageSchema: JSONSchema7 = {
   ...isNotEmpty('id', 'remoteJid', 'participant'),
 };
 
+export const lidToPhoneSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    lids: { type: 'array', minItems: 1, maxItems: 50, items: { type: 'string' } },
+  },
+  required: ['lids'],
+};
+
 export const pinChatSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

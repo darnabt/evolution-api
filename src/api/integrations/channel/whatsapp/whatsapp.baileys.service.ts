@@ -1197,9 +1197,42 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
+        // darnabt r6 2026-11-14 — WhatsApp gives a newly linked device each chat's unread count and
+        // «marked unread» from the phone (Conversation.unreadCount / markedAsUnread). Pass them on with
+        // the history so the receiver can show the chat as the phone does (not always read).
+        const chatsUnread: {
+          remoteJid: string;
+          remoteJidAlt?: string;
+          unreadCount: number;
+          markedAsUnread: boolean;
+          conversationTimestamp?: number;
+        }[] = [];
+        for (const chat of chats as any[]) {
+          if (!chat?.id) continue;
+          const hasCount = typeof chat.unreadCount === 'number';
+          const hasMark = typeof chat.markedAsUnread === 'boolean';
+          if (!hasCount && !hasMark) continue;
+          const alt = chat.id.endsWith('@lid')
+            ? await pnForLid(chat.id)
+            : typeof chat.pnJid === 'string'
+              ? jidNormalizedUser(chat.pnJid)
+              : undefined;
+          const tsRaw = chat.conversationTimestamp;
+          const ts = Long.isLong(tsRaw) ? tsRaw.toNumber() : Number(tsRaw) || undefined;
+          chatsUnread.push({
+            remoteJid: chat.id,
+            ...(alt ? { remoteJidAlt: alt } : {}),
+            unreadCount: hasCount ? Math.max(0, chat.unreadCount) : 0,
+            markedAsUnread: hasMark ? chat.markedAsUnread : false,
+            ...(ts ? { conversationTimestamp: ts } : {}),
+          });
+        }
+        if (chatsUnread.length) console.log(`history chats unread: ${chatsUnread.length} chats carry the phone's unread`);
+
         this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
           isLatest,
           progress,
+          ...(chatsUnread.length ? { chatsUnread } : {}),
         });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
@@ -4816,6 +4849,88 @@ export class BaileysStartupService extends ChannelStartupService {
         message: ['An error occurred while archiving the chat. Open a calling.', error.toString()],
       });
     }
+  }
+
+  /**
+   * darnabt r6 2026-11-14 — POST /chat/lidToPhone/{instance} {lids: string[] (<= 50)} -> [{lid, phone|null}].
+   * The phone number behind each hidden WhatsApp ID (LID), read-only: Baileys' own LID store (pairs
+   * WhatsApp sent with history / messages), then this number's stored messages that carried the pair
+   * (remoteJidAlt / participantAlt). Baileys rc.9 has no USync query for LID -> phone (its LID protocol
+   * only maps phone -> LID), so a miss stays null. Never logs out, restarts or sends anything; 8 s cap.
+   */
+  public async lidToPhone(data: { lids?: string[] }) {
+    const lids = Array.from(
+      new Set(
+        (Array.isArray(data?.lids) ? data.lids : [])
+          .filter((l) => typeof l === 'string' && l.trim())
+          .map((l) => {
+            const t = l.trim();
+            return jidNormalizedUser(t.includes('@') ? t : `${t}@lid`);
+          })
+          .filter((l) => l.endsWith('@lid')),
+      ),
+    ).slice(0, 50);
+    const found = new Map<string, string>();
+    const work = async () => {
+      for (const lid of lids) {
+        try {
+          const pn = await this.client?.signalRepository?.lidMapping?.getPNForLID(lid);
+          if (pn) found.set(lid, jidNormalizedUser(pn));
+        } catch {
+          // unknown pair
+        }
+      }
+      const missing = lids.filter((l) => !found.has(l));
+      if (!missing.length) return;
+      try {
+        const rows = (await this.prismaRepository.$queryRaw`
+          SELECT DISTINCT ON (lid) lid, pn FROM (
+            SELECT "key"->>'remoteJid' AS lid, "key"->>'remoteJidAlt' AS pn, "messageTimestamp"
+              FROM "Message"
+             WHERE "instanceId" = ${this.instanceId}
+               AND "key"->>'remoteJid' = ANY(${missing})
+               AND "key"->>'remoteJidAlt' LIKE '%@s.whatsapp.net'
+            UNION ALL
+            SELECT "key"->>'participant' AS lid, "key"->>'participantAlt' AS pn, "messageTimestamp"
+              FROM "Message"
+             WHERE "instanceId" = ${this.instanceId}
+               AND "key"->>'participant' = ANY(${missing})
+               AND "key"->>'participantAlt' LIKE '%@s.whatsapp.net'
+          ) x ORDER BY lid, "messageTimestamp" DESC`) as { lid: string; pn: string }[];
+        const pairs: { lid: string; pn: string }[] = [];
+        for (const r of rows ?? []) {
+          if (r?.lid && r?.pn && !found.has(r.lid)) {
+            const pn = jidNormalizedUser(r.pn);
+            found.set(r.lid, pn);
+            pairs.push({ lid: r.lid, pn });
+          }
+        }
+        if (pairs.length) {
+          try {
+            await this.client?.signalRepository?.lidMapping?.storeLIDPNMappings(pairs);
+          } catch {
+            // keeping the pair in Baileys is a bonus; the answer stands
+          }
+        }
+      } catch (e) {
+        this.logger.warn(`lidToPhone: message store lookup failed: ${(e as Error)?.message ?? e}`);
+      }
+    };
+    let timedOut = false;
+    await Promise.race([
+      work(),
+      new Promise<void>((resolve) =>
+        setTimeout(() => {
+          timedOut = true;
+          resolve();
+        }, 8000),
+      ),
+    ]);
+    const result = lids.map((lid) => ({ lid, phone: found.get(lid)?.split('@')[0] ?? null }));
+    this.logger.info(
+      `lidToPhone: asked ${lids.length} resolved ${result.filter((r) => r.phone).length}${timedOut ? ' (8 s cap hit)' : ''}`,
+    );
+    return result;
   }
 
   // darnabt: phone JID -> the chat's @lid (Baileys store, then one USync query; no message sent).

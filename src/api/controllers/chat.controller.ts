@@ -3,6 +3,7 @@ import {
   BlockUserDto,
   DeleteMessage,
   getBase64FromMediaMessageDto,
+  LidToPhoneDto,
   MarkChatUnreadDto,
   NumberDto,
   PinChatDto,
@@ -75,6 +76,15 @@ export class ChatController {
       throw new BadRequestException('Only Baileys instances can pin chats');
     }
     return await instance.pinChat(data);
+  }
+
+  // darnabt r6: phone number behind each LID (read-only)
+  public async lidToPhone({ instanceName }: InstanceDto, data: LidToPhoneDto) {
+    const instance: any = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.lidToPhone !== 'function') {
+      throw new BadRequestException('Only Baileys instances hold LID pairs');
+    }
+    return await instance.lidToPhone(data || {});
   }
 
   public async pinMessage({ instanceName }: InstanceDto, data: PinMessageDto) {

@@ -6,6 +6,7 @@ import {
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
+  LidToPhoneDto,
   PinChatDto,
   PinMessageDto,
   PrivacySettingDto,
@@ -29,6 +30,7 @@ import {
   markChatUnreadSchema,
   messageUpSchema,
   messageValidateSchema,
+  lidToPhoneSchema,
   pinChatSchema,
   pinMessageSchema,
   presenceSchema,
@@ -137,6 +139,17 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
+      })
+      // darnabt r6: the phone number behind each hidden WhatsApp ID (LID); read-only, <= 50 per call
+      .post(this.routerPath('lidToPhone'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<LidToPhoneDto>({
+          request: req,
+          schema: lidToPhoneSchema,
+          ClassRef: LidToPhoneDto,
+          execute: (instance, data) => chatController.lidToPhone(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
       })
       // darnabt: pin / unpin a whole chat in the chat list (app-state pin_v1, shared with the phone)
       .post(this.routerPath('pinChat'), ...guards, async (req, res) => {

@@ -82,6 +82,10 @@ export class ArchiveChatDto {
 }
 
 // darnabt: pin / unpin a whole CHAT (WhatsApp's chat-list pin, max 3, shared with the phone).
+export class LidToPhoneDto {
+  lids: string[];
+}
+
 export class PinChatDto {
   chat: string;
   pin: boolean;
