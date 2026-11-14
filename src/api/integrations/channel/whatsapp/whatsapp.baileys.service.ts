@@ -3811,6 +3811,17 @@ export class BaileysStartupService extends ChannelStartupService {
     });
   }
 
+  /** darnabt: the real LID (xxx@lid) Baileys holds for a phone JID, or undefined. Never throws. */
+  private async realLidForPn(jid: string): Promise<string | undefined> {
+    try {
+      if (!jid || !jid.endsWith('@s.whatsapp.net')) return undefined;
+      const found = await this.client?.signalRepository?.lidMapping?.getLIDForPN(jid);
+      return typeof found === 'string' && found.includes('@lid') ? found : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   // Chat Controller
   public async whatsappNumber(data: WhatsAppNumberDto) {
     const jids: {
@@ -3886,7 +3897,9 @@ export class BaileysStartupService extends ChannelStartupService {
             true,
             user.number,
             contacts.find((c) => c.remoteJid === cached.remoteJid)?.pushName,
-            cached.lid || (cached.remoteJid.includes('@lid') ? 'lid' : undefined),
+            (await this.realLidForPn(cached.remoteJid)) ||
+              cached.lid ||
+              (cached.remoteJid.includes('@lid') ? 'lid' : undefined),
           );
         }
 
@@ -3952,7 +3965,12 @@ export class BaileysStartupService extends ChannelStartupService {
           !!numberVerified?.exists,
           user.number,
           contacts.find((c) => c.remoteJid === numberJid)?.pushName,
-          undefined,
+          // darnabt: keep the LID Baileys' onWhatsApp returns (it was dropped) — falls back to Baileys' own LID store.
+          numberVerified?.exists
+            ? (typeof (numberVerified as any)?.lid === 'string' && (numberVerified as any).lid.includes('@lid')
+                ? (numberVerified as any).lid
+                : await this.realLidForPn(numberJid))
+            : undefined,
         );
       }),
     );
