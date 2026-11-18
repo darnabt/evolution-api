@@ -19,6 +19,7 @@ import { ChatRouter } from './chat.router';
 import { GroupRouter } from './group.router';
 import { InstanceRouter } from './instance.router';
 import { LabelRouter } from './label.router';
+import { LivenessRouter } from './liveness.router';
 import { ProxyRouter } from './proxy.router';
 import { MessageRouter } from './sendMessage.router';
 import { SettingsRouter } from './settings.router';
@@ -215,6 +216,7 @@ router
     });
   })
   .use('/instance', new InstanceRouter(configService, ...guards).router)
+  .use('/instance', new LivenessRouter(...guards).router)
   .use('/message', new MessageRouter(...guards).router)
   .use('/call', new CallRouter(...guards).router)
   .use('/chat', new ChatRouter(...guards).router)
