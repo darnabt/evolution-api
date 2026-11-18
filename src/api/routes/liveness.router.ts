@@ -2,7 +2,8 @@
 //   GET|POST /instance/socketPing/:instanceName    real w:p round trip on the number's socket (5 s);
 //                                                   ok true | false (claims open, does not answer) | null (not open yet)
 //   GET      /instance/deviceListed/:instanceName  does WhatsApp still list our linked device (true/false/unknown)
-//   POST     /instance/processRestart              bridge exits, Railway restarts it (global key; 429 within 10 min)
+//   POST     /instance/processRestart              bridge exits, Railway restarts it (global key; 429 within 10 min;
+//                                                   409 while a number is pairing or just paired)
 // None of them logs out, deletes a session or pairs a device.
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';

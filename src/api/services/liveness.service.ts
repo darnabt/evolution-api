@@ -4,6 +4,7 @@
 // own account, (3) ends the whole process so Railway starts it again (creds row + key files survive),
 // and (4) after a database outage ends, ends only the sockets that no longer answer, so the existing
 // close handler reconnects them once — escalating to (3) when that does not heal them.
+import { prismaErrorListeners } from '@api/repository/repository.service';
 import { prismaRepository, waMonitor } from '@api/server.module';
 import { Integration } from '@api/types/wa.types';
 import { Logger } from '@config/logger.config';
@@ -14,6 +15,8 @@ import { join } from 'path';
 
 /** A real `w:p` ping must come back within this time, or the socket counts as dead. */
 const PING_TIMEOUT_MS = 5_000;
+/** «open» with a closed websocket is looked at again after this long before it counts as dead. */
+const MID_RECONNECT_RECHECK_MS = 2_000;
 /** The device-list (usync) question gets a little longer: it is a bigger answer. */
 const DEVICE_LIST_TIMEOUT_MS = 10_000;
 /** A second process restart within this window is refused with 429. */
@@ -28,18 +31,38 @@ const PROCESS_EXIT_DELAY_MS = 500;
 const PROCESS_RESTART_STAMP = join(INSTANCE_DIR, '.liveness-process-restart.json');
 
 /**
- * While a number shows a QR / pairing code (state «connecting», no login yet), the exit waits — checking
- * every 5 s — so a restart never kills a scan in progress. It exits anyway after this long.
+ * A restart never lands during a pairing. A number is «pairing» while it shows a QR / pairing code
+ * («connecting», no login in its creds) and «just paired» from the moment a login appears on a number
+ * that had none until it has been open for 60 s (the new creds row + first-login keys are written in
+ * that time), or 10 min at most. processRestart refuses (409) while any number is pairing or just
+ * paired. If one starts in the 500 ms before the exit, the exit waits (checked every 2 s); still busy
+ * after 120 s → the restart is cancelled, never forced.
  */
+const PAIRING_WATCH_MS = 2_000;
+const JUST_PAIRED_OPEN_SETTLE_MS = 60_000;
+const JUST_PAIRED_MAX_MS = 10 * 60 * 1000;
 const PROCESS_EXIT_PAIRING_HOLD_MAX_MS = 120_000;
-const PROCESS_EXIT_PAIRING_POLL_MS = 5_000;
+const PROCESS_EXIT_PAIRING_POLL_MS = 2_000;
 
 /**
- * Self-check: how often the database is probed (one tiny read; no other work while it answers).
- * 10 s so a ~10-20 s outage (11-15 event E) cannot fall between two probes.
+ * Self-check: the database is probed with ONE tiny read every 30 s (the limit). A short outage between
+ * two probes is learned from the errors other queries already hit (Prisma error events, no extra read);
+ * the probe then only confirms the recovery.
  */
-const SELF_CHECK_DB_PROBE_MS = 10_000;
-const SELF_CHECK_DB_PROBE_TIMEOUT_MS = 5_000;
+const SELF_CHECK_DB_PROBE_MS = 30_000;
+const SELF_CHECK_DB_PROBE_TIMEOUT_MS = 10_000;
+/** Prisma error texts that mean the database itself is not answering (P1001, P1017, P2024 and friends). */
+const DB_DOWN_ERROR_PATTERNS = [
+  /can't reach database server/i,
+  /server has closed the connection/i,
+  /timed out fetching a new connection/i,
+  /connection pool/i,
+  /\bP1001\b|\bP1017\b|\bP2024\b/,
+  /ECONNREFUSED|ECONNRESET|ETIMEDOUT/,
+  /terminating connection|connection terminated|connection reset/i,
+];
+/** WhatsApp answers after which the bridge does not reconnect; a process restart cannot help them. */
+const NO_RECONNECT_CODES = [401, 402, 403, 406];
 /** After the database answers again, give the sockets this long to settle before pinging them. */
 const SELF_CHECK_SETTLE_MS = 15_000;
 /**
@@ -102,11 +125,21 @@ export type ProcessRestartAnswer = {
   at: string;
   /** ISO time of the previous restart, when one was stamped. */
   previousAt: string | null;
-  /** The process exits this many ms after the answer at the earliest (later while a QR is out). */
+  /** The process exits this many ms after the answer (later only if a pairing starts in that time). */
   exitInMs: number;
-  /** Numbers showing a QR right now; the exit waits for them (at most 120 s). Usually []. */
+  /** Always [] now: a pairing at call time is refused with 409. Kept so the answer shape stays the same. */
   waitsForPairing: string[];
 };
+
+class LivenessConflictException {
+  constructor(...objectError: any[]) {
+    throw {
+      status: 409,
+      error: 'Conflict',
+      message: objectError.length > 0 ? objectError : undefined,
+    };
+  }
+}
 
 class TooManyRequestsException {
   constructor(...objectError: any[]) {
@@ -152,6 +185,14 @@ export class LivenessService {
   private dbDown = false;
   private healRunning = false;
 
+  private pairingWatchTimer: NodeJS.Timeout | null = null;
+  /** Numbers seen with a socket but no login in their creds (a QR / pairing code may be out). */
+  private readonly sawNoLogin = new Set<string>();
+  /** Numbers whose login appeared after sawNoLogin → when. Cleared after 60 s open (or 10 min). */
+  private readonly justPairedAt = new Map<string, number>();
+  /** When each number was first seen «open» in a row. */
+  private readonly openSince = new Map<string, number>();
+
   // ---------------------------------------------------------------------------------------------
   // Socket ping
   // ---------------------------------------------------------------------------------------------
@@ -176,14 +217,24 @@ export class LivenessService {
    * QR on screen) or not loaded is `ok:null` — the bridge cannot say, so it never claims dead.
    */
   public async socketPing(instanceName: string): Promise<SocketPingAnswer> {
-    const { sock, state, reason } = this.socketOf(instanceName);
-    const base = { instance: instanceName, state };
+    let { sock, state, reason } = this.socketOf(instanceName);
+    let base = { instance: instanceName, state };
 
     if (!sock) return { ...base, ok: null, alive: null, ms: null, wsOpen: false, reason };
 
-    const wsOpen = !!(sock as any).ws?.isOpen;
+    let wsOpen = !!(sock as any).ws?.isOpen;
     if (state !== 'open') return { ...base, ok: null, alive: null, ms: null, wsOpen, reason: 'not_open' };
-    if (!wsOpen) return { ...base, ok: false, alive: false, ms: null, wsOpen, reason: 'ws_not_open' };
+    if (!wsOpen) {
+      // The websocket closed but the «close» event may still be waiting in the serial event queue (state
+      // stays «open» until it is handled). Look again after 2 s: a routine reconnect is not a dead socket.
+      await new Promise((resolve) => setTimeout(resolve, MID_RECONNECT_RECHECK_MS));
+      ({ sock, state, reason } = this.socketOf(instanceName));
+      base = { instance: instanceName, state };
+      if (!sock) return { ...base, ok: null, alive: null, ms: null, wsOpen: false, reason };
+      wsOpen = !!(sock as any).ws?.isOpen;
+      if (state !== 'open') return { ...base, ok: null, alive: null, ms: null, wsOpen, reason: 'not_open' };
+      if (!wsOpen) return { ...base, ok: false, alive: false, ms: null, wsOpen, reason: 'ws_not_open' };
+    }
 
     const started = Date.now();
     try {
@@ -203,6 +254,19 @@ export class LivenessService {
     } catch (error) {
       const ms = Date.now() - started;
       const why = isTimeout(error) ? 'timeout' : `error: ${String((error as any)?.message ?? error)}`;
+      // The socket started reconnecting during the ping: cannot say, not dead.
+      const now = this.socketOf(instanceName);
+      if (now.state !== 'open') {
+        return {
+          instance: instanceName,
+          state: now.state,
+          ok: null,
+          alive: null,
+          ms,
+          wsOpen: !!(now.sock as any)?.ws?.isOpen,
+          reason: now.sock ? 'not_open' : now.reason,
+        };
+      }
       this.logger.warn(`socketPing ${instanceName}: no pong after ${ms} ms (${why})`);
       return { ...base, ok: false, alive: false, ms, wsOpen: !!(sock as any).ws?.isOpen, reason: why };
     }
@@ -340,6 +404,14 @@ export class LivenessService {
     if (this.restartScheduled) {
       throw new TooManyRequestsException('A process restart is already under way.');
     }
+    // Never during a pairing: a QR / pairing code is out, or a new login is still being written.
+    const busy = this.pairingBusyNames();
+    if (busy.length > 0) {
+      throw new LivenessConflictException(
+        `A number is pairing or just paired (${busy.join(', ')}); a restart now could lose its new login.`,
+        'Try again once it has been open for 60 s.',
+      );
+    }
     this.restartScheduled = true;
 
     try {
@@ -350,11 +422,8 @@ export class LivenessService {
       throw new LivenessInternalException('Could not record the restart stamp; restart refused.', String(error));
     }
 
-    const waitsForPairing = this.pairingInstanceNames();
     this.logger.warn(
-      `processRestart (${by}): exit in ${PROCESS_EXIT_DELAY_MS} ms` +
-        (waitsForPairing.length ? ` (later: waiting for a QR on ${waitsForPairing.join(', ')}, at most 120 s)` : '') +
-        '; Railway starts it again. No number is logged out.',
+      `processRestart (${by}): exit in ${PROCESS_EXIT_DELAY_MS} ms; Railway starts it again. No number is logged out.`,
     );
     this.scheduleExit(Date.now() + PROCESS_EXIT_PAIRING_HOLD_MAX_MS);
 
@@ -363,31 +432,94 @@ export class LivenessService {
       at: new Date(now).toISOString(),
       previousAt: previous !== null ? new Date(previous).toISOString() : null,
       exitInMs: PROCESS_EXIT_DELAY_MS,
-      waitsForPairing,
+      waitsForPairing: [],
     };
   }
 
-  /** Numbers showing a QR / pairing code right now: «connecting» with no login in their creds yet. */
-  private pairingInstanceNames(): string[] {
-    const all = waMonitor?.waInstances ?? {};
-    return Object.keys(all).filter((name) => {
-      const instance = all[name];
-      return (
-        instance?.client && instance.connectionStatus?.state === 'connecting' && !instance.client.authState?.creds?.me
-      );
-    });
+  private hasLogin(instance: any): boolean {
+    return !!instance?.client?.authState?.creds?.me;
   }
 
-  /** Exits after PROCESS_EXIT_DELAY_MS, or later while a QR is out (re-checked every 5 s, until the deadline). */
+  /** In memory only (no database): notes which numbers have no login, gain one, and stay open. */
+  private watchPairing(): void {
+    const all = waMonitor?.waInstances ?? {};
+    const now = Date.now();
+    for (const name of Object.keys(all)) {
+      const instance = all[name];
+      if (instance?.connectionStatus?.state === 'open') {
+        if (!this.openSince.has(name)) this.openSince.set(name, now);
+      } else {
+        this.openSince.delete(name);
+      }
+      if (instance?.client && !this.hasLogin(instance)) {
+        this.sawNoLogin.add(name);
+        this.justPairedAt.delete(name);
+      } else if (this.hasLogin(instance) && this.sawNoLogin.has(name)) {
+        this.sawNoLogin.delete(name);
+        this.justPairedAt.set(name, now);
+        this.logger.info(`pairing: ${name} has a new login; no process restart until it has been open for 60 s`);
+      }
+      const pairedAt = this.justPairedAt.get(name);
+      if (pairedAt !== undefined) {
+        const openAt = this.openSince.get(name);
+        const openFor = openAt !== undefined ? now - openAt : 0;
+        if (openFor >= JUST_PAIRED_OPEN_SETTLE_MS || now - pairedAt >= JUST_PAIRED_MAX_MS) {
+          this.justPairedAt.delete(name);
+        }
+      }
+    }
+    for (const map of [this.openSince, this.justPairedAt]) {
+      for (const name of Array.from(map.keys())) if (!all[name]) map.delete(name);
+    }
+    for (const name of Array.from(this.sawNoLogin)) if (!all[name]) this.sawNoLogin.delete(name);
+  }
+
+  /** Runs the in-memory pairing watch every 2 s (always on; it does no database work). */
+  private startPairingWatch(): void {
+    if (this.pairingWatchTimer) return;
+    this.pairingWatchTimer = setInterval(() => {
+      try {
+        this.watchPairing();
+      } catch (error) {
+        this.logger.warn(`pairing watch: ${String(error)}`);
+      }
+    }, PAIRING_WATCH_MS);
+    this.pairingWatchTimer.unref?.();
+  }
+
+  /** Whether this number is pairing (QR / code out) or just paired (new login not yet open for 60 s). */
+  private isPairingBusy(name: string): boolean {
+    const instance = waMonitor?.waInstances?.[name];
+    if (!instance) return false;
+    const login = this.hasLogin(instance);
+    if (instance.client && instance.connectionStatus?.state === 'connecting' && !login) return true;
+    if (this.justPairedAt.has(name)) return true;
+    // The login appeared after the last watch tick (≤ 2 s ago).
+    return login && this.sawNoLogin.has(name);
+  }
+
+  private pairingBusyNames(): string[] {
+    this.watchPairing();
+    return Object.keys(waMonitor?.waInstances ?? {}).filter((name) => this.isPairingBusy(name));
+  }
+
+  /**
+   * Exits after PROCESS_EXIT_DELAY_MS. If a pairing started in that time, waits (re-checked every 2 s); still
+   * busy at the deadline → the restart is cancelled. It never exits during a pairing.
+   */
   private scheduleExit(deadline: number): void {
     const tick = () => {
-      const pairing = this.pairingInstanceNames();
-      if (pairing.length > 0 && Date.now() < deadline) {
+      const busy = this.pairingBusyNames();
+      if (busy.length > 0 && Date.now() < deadline) {
         setTimeout(tick, PROCESS_EXIT_PAIRING_POLL_MS);
         return;
       }
-      if (pairing.length > 0) {
-        this.logger.warn(`processRestart: QR still out on ${pairing.join(', ')} after 120 s; exiting anyway`);
+      if (busy.length > 0) {
+        this.restartScheduled = false;
+        this.logger.warn(
+          `processRestart: still pairing on ${busy.join(', ')} after 120 s; restart CANCELLED (never during a pairing)`,
+        );
+        return;
       }
       process.exit(1);
     };
@@ -399,22 +531,37 @@ export class LivenessService {
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * Probes the database every 10 s (one tiny `Instance` read). Nothing else happens while it answers. When an
-   * outage ends: wait 15 s, ping every number the table calls «open»; end() only the dead sockets (ok:false;
-   * the existing close handler reconnects each once); re-ping after 60 s and again after 120 s more. A socket
-   * still dead (ok:false), or still not open after both waits → process restart (the proven cure, study
-   * §2.4), under the same 10-minute stamp. Turn off with LIVENESS_SELF_CHECK=false.
+   * Probes the database every 30 s (ONE tiny `Instance` read). A shorter outage is learned from the Prisma
+   * errors other queries already hit. Nothing else happens while it answers. When an outage ends: wait 15 s,
+   * ping every number the table calls «open»; end() only the dead sockets (ok:false; the existing close
+   * handler reconnects each once); re-ping after 60 s and again after 120 s more. A socket still dead
+   * (ok:false), or still reconnecting with its login after both waits → process restart (the proven cure,
+   * study §2.4), under the same 10-minute stamp and never during a pairing. Turn off with
+   * LIVENESS_SELF_CHECK=false (the pairing watch stays on).
    */
   public startSelfCheck(): void {
+    this.startPairingWatch();
     if (this.selfCheckTimer) return;
     if (String(process.env.LIVENESS_SELF_CHECK ?? '').toLowerCase() === 'false') {
       this.logger.info('self-check off (LIVENESS_SELF_CHECK=false)');
       return;
     }
+    prismaErrorListeners.push((message) => this.onDatabaseError(message));
     this.selfCheckTimer = setInterval(() => {
       this.probeDatabase().catch((error) => this.logger.error(`self-check: ${String(error)}`));
     }, SELF_CHECK_DB_PROBE_MS);
     this.selfCheckTimer.unref?.();
+  }
+
+  /** A query elsewhere hit a «database not answering» error: mark it down; the next probe confirms recovery. */
+  private onDatabaseError(message: string): void {
+    if (this.dbDown) return;
+    if (!DB_DOWN_ERROR_PATTERNS.some((pattern) => pattern.test(message))) return;
+    this.dbDown = true;
+    this.logger.warn(
+      `self-check: a query hit a database outage (${message.slice(0, 160).replace(/\s+/g, ' ')}); ` +
+        'will check every socket once the database answers again',
+    );
   }
 
   private async probeDatabase(): Promise<void> {
@@ -463,6 +610,20 @@ export class LivenessService {
     });
   }
 
+  /**
+   * Not open, but still a number a restart can help: it has its login, WhatsApp did not refuse it
+   * (401/402/403/406 → no reconnect), and it is not pairing.
+   */
+  private isStuckReconnecting(name: string): boolean {
+    const instance = waMonitor?.waInstances?.[name];
+    if (!instance?.client) return false;
+    const state = instance.connectionStatus?.state;
+    if (state !== 'connecting' && state !== 'close') return false;
+    if (!this.hasLogin(instance)) return false;
+    if (NO_RECONNECT_CODES.includes(Number(instance.connectionStatus?.statusReason))) return false;
+    return !this.isPairingBusy(name);
+  }
+
   private async healAfterDatabaseRecovery(): Promise<void> {
     if (this.healRunning) return;
     this.healRunning = true;
@@ -487,8 +648,9 @@ export class LivenessService {
         }
       }
 
-      // Re-ping after each wait. ok:false → restart now. Still reconnecting (not_open) → next wait; still not
-      // open after the last wait → stuck → restart. Gone from this process (not_loaded, …) → dropped.
+      // Re-ping after each wait. ok:false → restart now. Still reconnecting with its login → next wait; still
+      // not open after the last wait → stuck → restart. Dropped (a restart cannot help them): gone from this
+      // process (not_loaded, …), WhatsApp said 401/402/403/406 (logged out / banned), or a QR / new login.
       let pending = dead;
       let stillDead: string[] = [];
       for (const waitMs of SELF_CHECK_RECHECK_MS) {
@@ -497,7 +659,8 @@ export class LivenessService {
         stillDead = answers.filter((answer) => answer.ok === false).map((answer) => answer.instance);
         pending = answers
           .filter((answer) => answer.ok === null && answer.reason === 'not_open')
-          .map((answer) => answer.instance);
+          .map((answer) => answer.instance)
+          .filter((name) => this.isStuckReconnecting(name));
         if (stillDead.length > 0 || pending.length === 0) break;
         this.logger.info(`self-check: still reconnecting, looking again later: ${pending.join(', ')}`);
       }
