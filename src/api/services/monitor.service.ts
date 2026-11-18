@@ -297,7 +297,16 @@ export class WAMonitoringService {
       this.logger.info(
         `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
       );
-      await instance.connectToWhatsapp();
+      // darnabt: a boot connect that fails (e.g. the saved login could not be read during a database hiccup)
+      // must not leave the number unregistered: register it anyway (state close) and let it retry by itself.
+      try {
+        await instance.connectToWhatsapp();
+      } catch (error) {
+        this.logger.error(
+          `Auto-connect of "${instanceData.instanceName}" failed, registering it and retrying: ${error?.message ?? error}`,
+        );
+        if (typeof (instance as any).retryConnectLater === 'function') (instance as any).retryConnectLater();
+      }
     } else {
       this.logger.info(
         `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
@@ -340,9 +349,21 @@ export class WAMonitoringService {
   private async loadInstancesFromDatabasePostgres() {
     const clientName = await this.configService.get<Database>('DATABASE').CONNECTION.CLIENT_NAME;
 
-    const instances = await this.prismaRepository.instance.findMany({
-      where: { clientName: clientName },
-    });
+    // darnabt: a database blip at boot must not leave every number unloaded until the next restart;
+    // only this read is retried (nothing is set up yet), up to 12 times 5 s apart
+    let instances: any[];
+    for (let attempt = 1; ; attempt++) {
+      try {
+        instances = await this.prismaRepository.instance.findMany({
+          where: { clientName: clientName },
+        });
+        break;
+      } catch (error) {
+        if (attempt >= 12) throw error;
+        this.logger.warn(`loading instances failed (try ${attempt}): ${error?.message ?? error} — retrying in 5s`);
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+    }
 
     if (instances.length === 0) {
       return;
