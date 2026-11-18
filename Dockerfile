@@ -30,6 +30,8 @@ RUN chmod +x ./Docker/scripts/* && dos2unix ./Docker/scripts/*
 RUN node ./Docker/scripts/patch-baileys-history.js
 # darnabt: an app-state REMOVE mutation is not a change (mark unread on WhatsApp Web arrived as read)
 RUN node ./Docker/scripts/patch-baileys-appstate.js
+# darnabt: an ignored status@broadcast message gets a plain ack, not NACK 500 (the nack closed the stream every ~50 min)
+RUN node ./Docker/scripts/patch-baileys-status-ack.js
 
 RUN ./Docker/scripts/generate_database.sh
 
