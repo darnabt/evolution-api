@@ -286,6 +286,8 @@ export class BaileysStartupService extends ChannelStartupService {
       clearTimeout(this.reconnectRetryTimer);
       this.reconnectRetryTimer = null;
     }
+    // an attempt still in flight must not build a socket after a logout, and pending retries stop
+    this.settledGeneration = ++this.connectGeneration;
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -628,7 +630,9 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async createClient(number?: string): Promise<WASocket> {
-    this.instance.authState = await this.defineAuthState();
+    // darnabt: every attempt gets a number; only the newest attempt may build a socket (never two on one login)
+    const generation = ++this.connectGeneration;
+    const authState = await this.defineAuthState();
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
@@ -688,6 +692,13 @@ export class BaileysStartupService extends ChannelStartupService {
         };
       }
     }
+
+    // darnabt: last await is above; from here to makeWASocket runs without a pause, so this check is final
+    if (generation !== this.connectGeneration) {
+      throw new Error('connect attempt superseded by a newer one, not building a second socket');
+    }
+    this.settledGeneration = generation;
+    this.instance.authState = authState;
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,
@@ -779,41 +790,58 @@ export class BaileysStartupService extends ChannelStartupService {
 
   // darnabt: a reconnect that fails (e.g. the saved login could not be read because the database hiccuped)
   // is retried with a growing wait (5 s, 10 s … max 60 s) instead of leaving the number dead. It never logs
-  // out and never asks for a QR. It stops if the instance was deleted meanwhile.
+  // out and never asks for a QR. It stops if the instance was deleted meanwhile, or once any attempt built a
+  // socket (or the instance logged out) after this chain started.
   private reconnectRetryTimer: NodeJS.Timeout | null = null;
+  // connectGeneration: +1 per createClient attempt. settledGeneration: the attempt that last built a socket
+  // (or the logout). An attempt that is not the newest never builds a socket.
+  private connectGeneration = 0;
+  private settledGeneration = 0;
 
   private async reconnectAfterClose(attempt = 1): Promise<void> {
+    const settledAtStart = this.settledGeneration;
     try {
       await this.connectToWhatsapp(this.phoneNumber);
     } catch (error) {
-      const waitMs = Math.min(attempt * 5_000, 60_000);
-      this.logger.warn(
-        `reconnect failed (try ${attempt}): ${error?.message ?? error} — retrying in ${waitMs / 1000}s`,
-      );
-      if (this.reconnectRetryTimer) clearTimeout(this.reconnectRetryTimer);
-      this.reconnectRetryTimer = setTimeout(async () => {
-        this.reconnectRetryTimer = null;
-        try {
-          const row = await this.prismaRepository.instance.findUnique({ where: { id: this.instanceId } });
-          if (!row) return;
-        } catch {
-          // database still unreachable: try anyway; a failed try schedules the next one
-        }
-        await this.reconnectAfterClose(attempt + 1);
-      }, waitMs);
+      this.scheduleReconnect(attempt, settledAtStart, error);
     }
   }
 
-  public async connectToWhatsapp(number?: string): Promise<WASocket> {
-    if (this.reconnectRetryTimer) {
-      clearTimeout(this.reconnectRetryTimer);
+  private scheduleReconnect(attempt: number, settledAtStart: number, error?: any) {
+    if (this.settledGeneration !== settledAtStart) return; // a socket was built meanwhile, or logged out
+    const waitMs = Math.min(attempt * 5_000, 60_000);
+    this.logger.warn(
+      `reconnect failed (try ${attempt}): ${error?.message ?? error} — retrying in ${waitMs / 1000}s`,
+    );
+    if (this.reconnectRetryTimer) clearTimeout(this.reconnectRetryTimer);
+    this.reconnectRetryTimer = setTimeout(async () => {
       this.reconnectRetryTimer = null;
-    }
+      try {
+        const row = await this.prismaRepository.instance.findUnique({ where: { id: this.instanceId } });
+        if (!row) return;
+      } catch {
+        // database still unreachable: try anyway; a failed try schedules the next one
+      }
+      // re-check after the await: another connect may have built the socket while we waited
+      if (this.settledGeneration !== settledAtStart) return;
+      await this.reconnectAfterClose(attempt + 1);
+    }, waitMs);
+  }
+
+  // darnabt: used by the monitor when the boot connect failed, so the number is retried instead of left dead
+  public retryConnectLater() {
+    this.scheduleReconnect(1, this.settledGeneration, 'boot connect failed');
+  }
+
+  public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    // a pending retry is not cleared here: when it fires it stops by itself if this connect built a socket,
+    // and it still runs if this connect failed
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
+      // darnabt: these run un-awaited; a failed read is one logged line, not an unhandled rejection
+      this.loadChatwoot().catch((e) => this.logger.warn(`loadChatwoot failed: ${e?.message ?? e}`));
+      this.loadSettings().catch((e) => this.logger.warn(`loadSettings failed: ${e?.message ?? e}`));
+      this.loadWebhook().catch((e) => this.logger.warn(`loadWebhook failed: ${e?.message ?? e}`));
+      this.loadProxy().catch((e) => this.logger.warn(`loadProxy failed: ${e?.message ?? e}`));
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({
@@ -5380,7 +5408,7 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.client.updateLastSeenPrivacy(settings.last);
       await this.client.updateGroupsAddPrivacy(settings.groupadd);
 
-      this.reloadConnection();
+      this.reloadConnection().catch((e) => this.logger.warn(`reloadConnection failed: ${e?.message ?? e}`));
 
       return {
         update: 'success',
@@ -5469,7 +5497,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       await this.client.updateProfilePicture(this.instance.wuid, pic);
 
-      this.reloadConnection();
+      this.reloadConnection().catch((e) => this.logger.warn(`reloadConnection failed: ${e?.message ?? e}`));
 
       return { update: 'success' };
     } catch (error) {
@@ -5481,7 +5509,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       await this.client.removeProfilePicture(this.instance.wuid);
 
-      this.reloadConnection();
+      this.reloadConnection().catch((e) => this.logger.warn(`reloadConnection failed: ${e?.message ?? e}`));
 
       return { update: 'success' };
     } catch (error) {
