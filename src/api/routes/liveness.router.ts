@@ -1,5 +1,6 @@
 // darnabt: liveness routes (study SCAN-ROOT-CAUSE-v1 §5 (c) F5 and (d) F6). Mounted under /instance.
-//   GET|POST /instance/socketPing/:instanceName    real w:p round trip on the number's socket (5 s)
+//   GET|POST /instance/socketPing/:instanceName    real w:p round trip on the number's socket (5 s);
+//                                                   ok true | false (claims open, does not answer) | null (not open yet)
 //   GET      /instance/deviceListed/:instanceName  does WhatsApp still list our linked device (true/false/unknown)
 //   POST     /instance/processRestart              bridge exits, Railway restarts it (global key; 429 within 10 min)
 // None of them logs out, deletes a session or pairs a device.

@@ -27,27 +27,51 @@ const PROCESS_EXIT_DELAY_MS = 500;
  */
 const PROCESS_RESTART_STAMP = join(INSTANCE_DIR, '.liveness-process-restart.json');
 
-/** Self-check: how often the database is probed (one tiny read; no other work while it answers). */
-const SELF_CHECK_DB_PROBE_MS = 30_000;
-const SELF_CHECK_DB_PROBE_TIMEOUT_MS = 10_000;
+/**
+ * While a number shows a QR / pairing code (state «connecting», no login yet), the exit waits — checking
+ * every 5 s — so a restart never kills a scan in progress. It exits anyway after this long.
+ */
+const PROCESS_EXIT_PAIRING_HOLD_MAX_MS = 120_000;
+const PROCESS_EXIT_PAIRING_POLL_MS = 5_000;
+
+/**
+ * Self-check: how often the database is probed (one tiny read; no other work while it answers).
+ * 10 s so a ~10-20 s outage (11-15 event E) cannot fall between two probes.
+ */
+const SELF_CHECK_DB_PROBE_MS = 10_000;
+const SELF_CHECK_DB_PROBE_TIMEOUT_MS = 5_000;
 /** After the database answers again, give the sockets this long to settle before pinging them. */
 const SELF_CHECK_SETTLE_MS = 15_000;
-/** After ending the dead sockets, re-ping them after this long; still dead → process restart. */
-const SELF_CHECK_RECHECK_MS = 60_000;
+/**
+ * After ending the dead sockets, re-ping them after each of these waits. A socket that claims open but
+ * does not answer (ok:false) → process restart at once. One still reconnecting («connecting», ok:null) is
+ * given the next wait; only one still not open after all of them (~3 min) counts as stuck → restart.
+ */
+const SELF_CHECK_RECHECK_MS = [60_000, 120_000];
 
 export type SocketPingAnswer = {
   instance: string;
-  /** true only when the socket answered a real ping in time. Nawah reads `ok`. */
-  ok: boolean;
-  /** Same value as `ok`. */
-  alive: boolean;
+  /**
+   * true  = the socket answered a real ping in time.
+   * false = the number claims «open» but its socket is dead (ws_not_open, timeout, error: …).
+   * null  = cannot say: the number is not open yet (reconnecting, QR on screen) or not loaded here
+   *         (not_open, not_loaded, no_socket, not_baileys). Never read null as dead.
+   * Nawah reads `ok`.
+   */
+  ok: boolean | null;
+  /** Same value as `ok` (true / false / null). */
+  alive: boolean | null;
   /** Round-trip time of the ping in ms (also set when it timed out / failed: time spent waiting). */
   ms: number | null;
   /** The bridge's own connection state for the number (`open`, `connecting`, `close`). */
   state: string | null;
   /** Whether the websocket under the number reports itself open. */
   wsOpen: boolean;
-  /** Why it is not alive: not_loaded | not_baileys | no_socket | not_open | ws_not_open | timeout | error: … */
+  /**
+   * Why it is not alive.
+   * ok:false → ws_not_open | timeout | error: …
+   * ok:null  → not_open | not_loaded | no_socket | not_baileys
+   */
   reason?: string;
 };
 
@@ -57,10 +81,16 @@ export type DeviceListedAnswer = {
   listed: true | false | 'unknown';
   /** Our own device id (e.g. 80 for …:80@s.whatsapp.net), when known. */
   ownDevice: number | null;
-  /** Every device id WhatsApp lists for the account right now (0 = the phone). */
+  /** Every device id WhatsApp lists for the account right now (0 = the phone). Raw, unfiltered. */
   devices: number[];
   /** The listed device ids that are Meta-hosted. */
   hostedDevices: number[];
+  /** The account we asked about (our own id, device part dropped), when known. */
+  askedId: string | null;
+  /** The id of the usync entry the device list was read from (proves it is our own account). */
+  answeredId: string | null;
+  /** The bridge's own connection state for the number at the time of asking. */
+  state: string | null;
   ms: number | null;
   /** Why the answer is 'unknown'. */
   reason?: string;
@@ -72,8 +102,10 @@ export type ProcessRestartAnswer = {
   at: string;
   /** ISO time of the previous restart, when one was stamped. */
   previousAt: string | null;
-  /** The process exits this many ms after the answer. */
+  /** The process exits this many ms after the answer at the earliest (later while a QR is out). */
   exitInMs: number;
+  /** Numbers showing a QR right now; the exit waits for them (at most 120 s). Usually []. */
+  waitsForPairing: string[];
 };
 
 class TooManyRequestsException {
@@ -140,17 +172,18 @@ export class LivenessService {
   /**
    * A real round trip on the number's socket: the same `iq xmlns="w:p" <ping/>` Baileys sends as its
    * keep-alive, answered by WhatsApp's server. «open» in the table with a closed websocket, or a
-   * websocket that does not answer within 5 s, is `ok:false`.
+   * websocket that does not answer within 5 s, is `ok:false`. A number that is not open yet (reconnecting,
+   * QR on screen) or not loaded is `ok:null` — the bridge cannot say, so it never claims dead.
    */
   public async socketPing(instanceName: string): Promise<SocketPingAnswer> {
     const { sock, state, reason } = this.socketOf(instanceName);
     const base = { instance: instanceName, state };
 
-    if (!sock) return { ...base, ok: false, alive: false, ms: null, wsOpen: false, reason };
+    if (!sock) return { ...base, ok: null, alive: null, ms: null, wsOpen: false, reason };
 
     const wsOpen = !!(sock as any).ws?.isOpen;
+    if (state !== 'open') return { ...base, ok: null, alive: null, ms: null, wsOpen, reason: 'not_open' };
     if (!wsOpen) return { ...base, ok: false, alive: false, ms: null, wsOpen, reason: 'ws_not_open' };
-    if (state !== 'open') return { ...base, ok: false, alive: false, ms: null, wsOpen, reason: 'not_open' };
 
     const started = Date.now();
     try {
@@ -185,6 +218,9 @@ export class LivenessService {
    * every failure to ask is `'unknown'` — never a guessed false.
    */
   public async deviceListed(instanceName: string): Promise<DeviceListedAnswer> {
+    const { sock, state, reason } = this.socketOf(instanceName);
+    let askedId: string | null = null;
+
     const unknown = (
       reason: string,
       ownDevice: number | null = null,
@@ -195,17 +231,20 @@ export class LivenessService {
       ownDevice,
       devices: [],
       hostedDevices: [],
+      askedId,
+      answeredId: null,
+      state,
       ms,
       reason,
     });
 
-    const { sock, state, reason } = this.socketOf(instanceName);
     if (!sock) return unknown(reason);
 
     const meId: string | undefined = sock.user?.id ?? sock.authState?.creds?.me?.id;
     const me = meId ? jidDecode(meId) : undefined;
     const ownDevice = typeof me?.device === 'number' ? me.device : null;
     if (!meId || !me?.user) return unknown('no_own_id');
+    askedId = jidNormalizedUser(meId);
     if (ownDevice === null) return unknown('no_own_device_id');
 
     if (!(sock as any).ws?.isOpen) return unknown('ws_not_open', ownDevice);
@@ -216,7 +255,7 @@ export class LivenessService {
       const query = new USyncQuery()
         .withContext('message')
         .withDeviceProtocol()
-        .withUser(new USyncUser().withId(jidNormalizedUser(meId)));
+        .withUser(new USyncUser().withId(askedId));
 
       const result = await withTimeout(sock.executeUSyncQuery(query), DEVICE_LIST_TIMEOUT_MS, 'deviceListed');
       const ms = Date.now() - started;
@@ -242,7 +281,8 @@ export class LivenessService {
         this.logger.warn(`deviceListed ${instanceName}: WhatsApp does NOT list device :${ownDevice} (${listedText})`);
       }
 
-      return { instance: instanceName, listed, ownDevice, devices, hostedDevices, ms };
+      const answeredId: string | null = typeof (entry as any)?.id === 'string' ? (entry as any).id : null;
+      return { instance: instanceName, listed, ownDevice, devices, hostedDevices, askedId, answeredId, state, ms };
     } catch (error) {
       const ms = Date.now() - started;
       const why = isTimeout(error) ? 'timeout' : `error: ${String((error as any)?.message ?? error)}`;
@@ -310,17 +350,48 @@ export class LivenessService {
       throw new LivenessInternalException('Could not record the restart stamp; restart refused.', String(error));
     }
 
+    const waitsForPairing = this.pairingInstanceNames();
     this.logger.warn(
-      `processRestart (${by}): exit in ${PROCESS_EXIT_DELAY_MS} ms; Railway starts it again. No number is logged out.`,
+      `processRestart (${by}): exit in ${PROCESS_EXIT_DELAY_MS} ms` +
+        (waitsForPairing.length ? ` (later: waiting for a QR on ${waitsForPairing.join(', ')}, at most 120 s)` : '') +
+        '; Railway starts it again. No number is logged out.',
     );
-    setTimeout(() => process.exit(1), PROCESS_EXIT_DELAY_MS);
+    this.scheduleExit(Date.now() + PROCESS_EXIT_PAIRING_HOLD_MAX_MS);
 
     return {
       restarting: true,
       at: new Date(now).toISOString(),
       previousAt: previous !== null ? new Date(previous).toISOString() : null,
       exitInMs: PROCESS_EXIT_DELAY_MS,
+      waitsForPairing,
     };
+  }
+
+  /** Numbers showing a QR / pairing code right now: «connecting» with no login in their creds yet. */
+  private pairingInstanceNames(): string[] {
+    const all = waMonitor?.waInstances ?? {};
+    return Object.keys(all).filter((name) => {
+      const instance = all[name];
+      return (
+        instance?.client && instance.connectionStatus?.state === 'connecting' && !instance.client.authState?.creds?.me
+      );
+    });
+  }
+
+  /** Exits after PROCESS_EXIT_DELAY_MS, or later while a QR is out (re-checked every 5 s, until the deadline). */
+  private scheduleExit(deadline: number): void {
+    const tick = () => {
+      const pairing = this.pairingInstanceNames();
+      if (pairing.length > 0 && Date.now() < deadline) {
+        setTimeout(tick, PROCESS_EXIT_PAIRING_POLL_MS);
+        return;
+      }
+      if (pairing.length > 0) {
+        this.logger.warn(`processRestart: QR still out on ${pairing.join(', ')} after 120 s; exiting anyway`);
+      }
+      process.exit(1);
+    };
+    setTimeout(tick, PROCESS_EXIT_DELAY_MS);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -328,11 +399,11 @@ export class LivenessService {
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * Probes the database every 30 s (one tiny `Instance` read). Nothing else happens while it answers. When an
-   * outage ends: wait 15 s, ping every number the table calls «open»; end() only the dead sockets
-   * (the existing close handler reconnects each once); re-ping after 60 s; any still dead → process
-   * restart (the proven cure, study §2.4), under the same 10-minute stamp. Turn off with
-   * LIVENESS_SELF_CHECK=false.
+   * Probes the database every 10 s (one tiny `Instance` read). Nothing else happens while it answers. When an
+   * outage ends: wait 15 s, ping every number the table calls «open»; end() only the dead sockets (ok:false;
+   * the existing close handler reconnects each once); re-ping after 60 s and again after 120 s more. A socket
+   * still dead (ok:false), or still not open after both waits → process restart (the proven cure, study
+   * §2.4), under the same 10-minute stamp. Turn off with LIVENESS_SELF_CHECK=false.
    */
   public startSelfCheck(): void {
     if (this.selfCheckTimer) return;
@@ -398,7 +469,8 @@ export class LivenessService {
     try {
       const names = this.openBaileysInstanceNames();
       const first = await Promise.all(names.map((name) => this.socketPing(name)));
-      const dead = first.filter((answer) => !answer.ok).map((answer) => answer.instance);
+      // Only a socket that claims open but does not answer is dead; ok:null (cannot say) is left alone.
+      const dead = first.filter((answer) => answer.ok === false).map((answer) => answer.instance);
 
       if (dead.length === 0) {
         this.logger.info(`self-check: all ${names.length} open sockets answer after the database recovery`);
@@ -415,16 +487,28 @@ export class LivenessService {
         }
       }
 
-      await new Promise((resolve) => setTimeout(resolve, SELF_CHECK_RECHECK_MS));
+      // Re-ping after each wait. ok:false → restart now. Still reconnecting (not_open) → next wait; still not
+      // open after the last wait → stuck → restart. Gone from this process (not_loaded, …) → dropped.
+      let pending = dead;
+      let stillDead: string[] = [];
+      for (const waitMs of SELF_CHECK_RECHECK_MS) {
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        const answers = await Promise.all(pending.map((name) => this.socketPing(name)));
+        stillDead = answers.filter((answer) => answer.ok === false).map((answer) => answer.instance);
+        pending = answers
+          .filter((answer) => answer.ok === null && answer.reason === 'not_open')
+          .map((answer) => answer.instance);
+        if (stillDead.length > 0 || pending.length === 0) break;
+        this.logger.info(`self-check: still reconnecting, looking again later: ${pending.join(', ')}`);
+      }
+      if (stillDead.length === 0) stillDead = pending;
 
-      const second = await Promise.all(dead.map((name) => this.socketPing(name)));
-      const stillDead = second.filter((answer) => !answer.ok).map((answer) => answer.instance);
       if (stillDead.length === 0) {
         this.logger.info(`self-check: healed without a restart: ${dead.join(', ')}`);
         return;
       }
 
-      this.logger.warn(`self-check: still dead after reconnect: ${stillDead.join(', ')}; restarting the process`);
+      this.logger.warn(`self-check: still dead or stuck after reconnect: ${stillDead.join(', ')}; restarting`);
       try {
         await this.processRestart('self-check');
       } catch (error) {
