@@ -287,6 +287,12 @@ export class BaileysStartupService extends ChannelStartupService {
   public async logoutInstance() {
     this.sentContactFingerprints.clear();
     this.invalidateSettingsCache();
+    if (this.reconnectRetryTimer) {
+      clearTimeout(this.reconnectRetryTimer);
+      this.reconnectRetryTimer = null;
+    }
+    // an attempt still in flight must not build a socket after a logout, and pending retries stop
+    this.settledGeneration = ++this.connectGeneration;
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -461,7 +467,7 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       }
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        await this.reconnectAfterClose();
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -629,15 +635,16 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async createClient(number?: string): Promise<WASocket> {
-    this.instance.authState = await this.defineAuthState();
+    // darnabt: every attempt gets a number; only the newest attempt may build a socket (never two on one login)
+    const generation = ++this.connectGeneration;
+    const authState = await this.defineAuthState();
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
     let browserOptions = {};
 
     if (number || this.phoneNumber) {
-      this.phoneNumber = number;
-
+      // darnabt: this.phoneNumber is set at the end, only by the attempt that builds the socket
       this.logger.info(`Phone number: ${number}`);
     } else {
       const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
@@ -689,6 +696,13 @@ export class BaileysStartupService extends ChannelStartupService {
         };
       }
     }
+
+    // darnabt: last await is above; from here to makeWASocket runs without a pause, so this check is final
+    if (generation !== this.connectGeneration) {
+      throw new Error('connect attempt superseded by a newer one, not building a second socket');
+    }
+    this.settledGeneration = generation;
+    this.instance.authState = authState;
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,
@@ -759,6 +773,10 @@ export class BaileysStartupService extends ChannelStartupService {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
 
+    // darnabt: say 'connecting' at once (no await since the generation check), so a watchdog
+    // /instance/connect in the gap before the socket's own 'connecting' event never builds a second socket
+    this.stateConnection = { state: 'connecting', statusReason: 200 };
+
     this.eventHandler();
 
     this.client.ws.on('CB:call', (packet) => {
@@ -778,12 +796,60 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.client;
   }
 
-  public async connectToWhatsapp(number?: string): Promise<WASocket> {
+  // darnabt: a reconnect that fails (e.g. the saved login could not be read because the database hiccuped)
+  // is retried with a growing wait (5 s, 10 s … max 60 s) instead of leaving the number dead. It never logs
+  // out and never asks for a QR. It stops if the instance was deleted meanwhile, or once any attempt built a
+  // socket (or the instance logged out) after this chain started.
+  private reconnectRetryTimer: NodeJS.Timeout | null = null;
+  // connectGeneration: +1 per createClient attempt. settledGeneration: the attempt that last built a socket
+  // (or the logout). An attempt that is not the newest never builds a socket.
+  private connectGeneration = 0;
+  private settledGeneration = 0;
+
+  private async reconnectAfterClose(attempt = 1): Promise<void> {
+    const settledAtStart = this.settledGeneration;
     try {
-      this.loadChatwoot();
-      this.loadSettings();
-      this.loadWebhook();
-      this.loadProxy();
+      await this.connectToWhatsapp(this.phoneNumber);
+    } catch (error) {
+      this.scheduleReconnect(attempt, settledAtStart, error);
+    }
+  }
+
+  private scheduleReconnect(attempt: number, settledAtStart: number, error?: any) {
+    if (this.settledGeneration !== settledAtStart) return; // a socket was built meanwhile, or logged out
+    const waitMs = Math.min(attempt * 5_000, 60_000);
+    this.logger.warn(
+      `reconnect failed (try ${attempt}): ${error?.message ?? error} — retrying in ${waitMs / 1000}s`,
+    );
+    if (this.reconnectRetryTimer) clearTimeout(this.reconnectRetryTimer);
+    this.reconnectRetryTimer = setTimeout(async () => {
+      this.reconnectRetryTimer = null;
+      try {
+        const row = await this.prismaRepository.instance.findUnique({ where: { id: this.instanceId } });
+        if (!row) return;
+      } catch {
+        // database still unreachable: try anyway; a failed try schedules the next one
+      }
+      // re-check after the await: another connect may have built the socket while we waited
+      if (this.settledGeneration !== settledAtStart) return;
+      await this.reconnectAfterClose(attempt + 1);
+    }, waitMs);
+  }
+
+  // darnabt: used by the monitor when the boot connect failed, so the number is retried instead of left dead
+  public retryConnectLater() {
+    this.scheduleReconnect(1, this.settledGeneration, 'boot connect failed');
+  }
+
+  public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    // a pending retry is not cleared here: when it fires it stops by itself if this connect built a socket,
+    // and it still runs if this connect failed
+    try {
+      // darnabt: these run un-awaited; a failed read is one logged line, not an unhandled rejection
+      this.loadChatwoot().catch((e) => this.logger.warn(`loadChatwoot failed: ${e?.message ?? e}`));
+      this.loadSettings().catch((e) => this.logger.warn(`loadSettings failed: ${e?.message ?? e}`));
+      this.loadWebhook().catch((e) => this.logger.warn(`loadWebhook failed: ${e?.message ?? e}`));
+      this.loadProxy().catch((e) => this.logger.warn(`loadProxy failed: ${e?.message ?? e}`));
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({
@@ -2157,8 +2223,23 @@ export class BaileysStartupService extends ChannelStartupService {
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
+
+            // darnabt: the connection and the login are handled before the settings read, so a slow or
+            // down database can never drop a 'close' (no retry would start) or an 'open'/'connecting'
+            if (events['connection.update']) {
+              this.connectionUpdate(events['connection.update']);
+            }
+
+            if (events['creds.update']) {
+              this.instance.authState.saveCreds();
+            }
+
             this.eventBatchStep = 'findSettings';
-            const settings = await this.findSettings();
+            // darnabt: a failed settings read falls back to the last loaded settings instead of dropping the batch
+            const settings = await this.findSettings().catch((e) => {
+              this.logger.warn(`findSettings failed, using last loaded settings: ${e?.message ?? e}`);
+              return { ...this.localSettings };
+            });
 
             if (events.call) {
               const call = events.call[0];
@@ -2177,14 +2258,6 @@ export class BaileysStartupService extends ChannelStartupService {
               }
 
               this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
             }
 
             if (events['messaging-history.set']) {
@@ -5435,7 +5508,7 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.client.updateLastSeenPrivacy(settings.last);
       await this.client.updateGroupsAddPrivacy(settings.groupadd);
 
-      this.reloadConnection();
+      this.reloadConnection().catch((e) => this.logger.warn(`reloadConnection failed: ${e?.message ?? e}`));
 
       return {
         update: 'success',
@@ -5524,7 +5597,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       await this.client.updateProfilePicture(this.instance.wuid, pic);
 
-      this.reloadConnection();
+      this.reloadConnection().catch((e) => this.logger.warn(`reloadConnection failed: ${e?.message ?? e}`));
 
       return { update: 'success' };
     } catch (error) {
@@ -5536,7 +5609,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       await this.client.removeProfilePicture(this.instance.wuid);
 
-      this.reloadConnection();
+      this.reloadConnection().catch((e) => this.logger.warn(`reloadConnection failed: ${e?.message ?? e}`));
 
       return { update: 'success' };
     } catch (error) {
