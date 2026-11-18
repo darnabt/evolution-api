@@ -282,6 +282,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    if (this.reconnectRetryTimer) {
+      clearTimeout(this.reconnectRetryTimer);
+      this.reconnectRetryTimer = null;
+    }
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -456,7 +460,7 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       }
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        await this.reconnectAfterClose();
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -773,7 +777,38 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.client;
   }
 
+  // darnabt: a reconnect that fails (e.g. the saved login could not be read because the database hiccuped)
+  // is retried with a growing wait (5 s, 10 s … max 60 s) instead of leaving the number dead. It never logs
+  // out and never asks for a QR. It stops if the instance was deleted meanwhile.
+  private reconnectRetryTimer: NodeJS.Timeout | null = null;
+
+  private async reconnectAfterClose(attempt = 1): Promise<void> {
+    try {
+      await this.connectToWhatsapp(this.phoneNumber);
+    } catch (error) {
+      const waitMs = Math.min(attempt * 5_000, 60_000);
+      this.logger.warn(
+        `reconnect failed (try ${attempt}): ${error?.message ?? error} — retrying in ${waitMs / 1000}s`,
+      );
+      if (this.reconnectRetryTimer) clearTimeout(this.reconnectRetryTimer);
+      this.reconnectRetryTimer = setTimeout(async () => {
+        this.reconnectRetryTimer = null;
+        try {
+          const row = await this.prismaRepository.instance.findUnique({ where: { id: this.instanceId } });
+          if (!row) return;
+        } catch {
+          // database still unreachable: try anyway; a failed try schedules the next one
+        }
+        await this.reconnectAfterClose(attempt + 1);
+      }, waitMs);
+    }
+  }
+
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    if (this.reconnectRetryTimer) {
+      clearTimeout(this.reconnectRetryTimer);
+      this.reconnectRetryTimer = null;
+    }
     try {
       this.loadChatwoot();
       this.loadSettings();

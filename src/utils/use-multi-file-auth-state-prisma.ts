@@ -100,6 +100,8 @@ export default async function useMultiFileAuthStatePrisma(
         return;
       }
     }
+    // darnabt: never write empty creds over a saved login.
+    if (!data) return;
     await saveKey(sessionId, dataString);
     return;
   }
@@ -166,8 +168,33 @@ export default async function useMultiFileAuthStatePrisma(
     await deleteAuthKey(sessionId);
   }
 
-  let creds = await readData('creds');
-  if (!creds) {
+  // darnabt: a database hiccup must never cost the WhatsApp login. Only a read that WORKED and found no row
+  // means "new instance". A failed read (error, timeout, empty or unreadable row) throws, so the connection
+  // attempt fails and the reconnect path tries again later; it never falls through to initAuthCreds().
+  async function readSavedCreds(): Promise<{ found: boolean; creds?: any }> {
+    let lastError: any;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const row = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+        if (!row) return { found: false };
+        if (!row.creds) throw new Error('saved creds row is empty');
+        const rawData = JSON.parse(row.creds);
+        const parsedData = JSON.parse(rawData, BufferJSON.reviver);
+        if (!parsedData) throw new Error('saved creds could not be read');
+        return { found: true, creds: parsedData };
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+      }
+    }
+    const reason = lastError?.message ?? lastError;
+    logger.error(`auth read failed, keeping saved login, will retry: sessionId=${sessionId} reason=${reason}`);
+    throw new Error('auth read failed, keeping saved login, will retry');
+  }
+
+  const saved = await readSavedCreds();
+  let creds = saved.creds;
+  if (!saved.found) {
     creds = initAuthCreds();
     await writeData(creds, 'creds');
   }
