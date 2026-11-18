@@ -4,11 +4,13 @@
 //   GET      /instance/deviceListed/:instanceName  does WhatsApp still list our linked device (true/false/unknown)
 //   POST     /instance/processRestart              bridge exits, Railway restarts it (global key; 429 within 10 min;
 //                                                   409 while a number is pairing or just paired)
+//                                                   ONLY when LIVENESS_PROCESS_RESTART=true (default off:
+//                                                   not registered → the framework's own 404, as before)
 // None of them logs out, deletes a session or pairs a device.
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { authGuard } from '@api/guards/auth.guard';
-import { livenessService } from '@api/services/liveness.service';
+import { livenessService, processRestartEnabled } from '@api/services/liveness.service';
 import { RequestHandler, Router } from 'express';
 
 import { HttpStatus } from './index.router';
@@ -40,9 +42,12 @@ export class LivenessRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.OK).json(response);
-      })
-      // Global API key only (no instance in the path, so an instance token can never pass authGuard here).
-      .post(this.routerPath('processRestart', false), authGuard['apikey'], async (req, res) => {
+      });
+
+    // Default OFF: live Nawah already calls this route and reads its 404 as «not available».
+    // Global API key only (no instance in the path, so an instance token can never pass authGuard here).
+    if (processRestartEnabled()) {
+      this.router.post(this.routerPath('processRestart', false), authGuard['apikey'], async (req, res) => {
         const response = await this.dataValidate<InstanceDto>({
           request: req,
           schema: null,
@@ -52,6 +57,7 @@ export class LivenessRouter extends RouterBroker {
 
         return res.status(202).json(response);
       });
+    }
 
     livenessService.startSelfCheck();
   }

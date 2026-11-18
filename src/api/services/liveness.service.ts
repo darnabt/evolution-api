@@ -13,6 +13,17 @@ import { jidDecode, jidNormalizedUser, S_WHATSAPP_NET, USyncQuery, USyncUser, WA
 import { promises as fsp } from 'fs';
 import { join } from 'path';
 
+/**
+ * LIVENESS_PROCESS_RESTART (default OFF): only the exact value «true» turns the process restart on.
+ * Off → the POST /instance/processRestart route is not registered at all (an unknown route: the
+ * framework's own 404, exactly as before this branch), and processRestart() refuses before any stamp
+ * or exit, so the self-check heal can never end the process either. socketPing / deviceListed
+ * (read-only) are not affected. Read at call time; the route list is fixed at boot.
+ */
+export function processRestartEnabled(): boolean {
+  return String(process.env.LIVENESS_PROCESS_RESTART ?? '').toLowerCase() === 'true';
+}
+
 /** A real `w:p` ping must come back within this time, or the socket counts as dead. */
 const PING_TIMEOUT_MS = 5_000;
 /** «open» with a closed websocket is looked at again after this long before it counts as dead. */
@@ -386,6 +397,9 @@ export class LivenessService {
    * Refused (429) when one was stamped in the last 10 minutes — also across the restart itself.
    */
   public async processRestart(by = 'api'): Promise<ProcessRestartAnswer> {
+    if (!processRestartEnabled()) {
+      throw new LivenessConflictException('Process restart is off (LIVENESS_PROCESS_RESTART is not true).');
+    }
     if (this.restartScheduled) {
       throw new TooManyRequestsException('A process restart is already under way.');
     }
@@ -671,6 +685,10 @@ export class LivenessService {
         return;
       }
 
+      if (!processRestartEnabled()) {
+        this.logger.warn(`self-check: still dead or stuck: ${stillDead.join(', ')}; restart off, not restarting`);
+        return;
+      }
       this.logger.warn(`self-check: still dead or stuck after reconnect: ${stillDead.join(', ')}; restarting`);
       try {
         await this.processRestart('self-check');
