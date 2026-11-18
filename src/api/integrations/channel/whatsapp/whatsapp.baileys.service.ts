@@ -865,6 +865,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async reloadConnection(): Promise<WASocket> {
     try {
+      // darnabt 2026-11-18: never build a second socket next to a live one (createClient does not end the old
+      // client). End the current socket; its close handler reconnects once through reconnectAfterClose.
+      if (this.client && this.stateConnection?.state !== 'close') {
+        this.client.end(new Error('reload connection'));
+        return this.client;
+      }
       return await this.createClient(this.phoneNumber);
     } catch (error) {
       this.logger.error(error);
@@ -4223,6 +4229,41 @@ export class BaileysStartupService extends ChannelStartupService {
   private appStateHealPending = new Set<string>();
   private appStateLastKeyRequest = 0;
 
+  // darnabt 2026-11-18 (heal storm): the phone was asked for the app-state keys and shared nothing new.
+  // While that holds, the bridge does not ask again (nor resync every collection from v0) for 6 h unless a
+  // NEW key id goes missing, and a patch on a collection that failed (mark read/unread, pin…) fails at once
+  // with «app state not ready» instead of resync + rebuild + re-ask on every call. Cleared when one of the
+  // absent keys arrives or an ask brings new keys. In memory only: a restart costs at most one extra ask.
+  private appStateNotReady: { absent: Set<string>; seen: Set<string>; collections: Set<string>; at: number } | null =
+    null;
+  private readonly appStateReaskMs = 6 * 60 * 60_000;
+
+  private markAppStateNotReady(absent: string[]) {
+    const prev = this.appStateNotReady;
+    this.appStateNotReady = {
+      absent: new Set(absent),
+      seen: new Set(absent),
+      collections: new Set(prev?.collections ?? []),
+      at: Date.now(),
+    };
+  }
+
+  private clearAppStateNotReady(reason: string) {
+    if (!this.appStateNotReady) return;
+    this.appStateNotReady = null;
+    this.logger.warn(`app-state: ${reason} — app state may be ready again, the next change will try`);
+  }
+
+  // the «app state not ready» text while the 6 h hold is on (for one collection, or for any when name is omitted)
+  private appStateNotReadyError(name?: string): string | null {
+    const nr = this.appStateNotReady;
+    if (!nr || Date.now() - nr.at >= this.appStateReaskMs) return null;
+    if (name !== undefined && !nr.collections.has(name)) return null;
+    return `app state not ready: ${nr.absent.size} app-state key(s) missing on this linked device and the phone shared no new keys when asked at ${new Date(
+      nr.at,
+    ).toISOString()} — not retrying; next ask after ${new Date(nr.at + this.appStateReaskMs).toISOString()}`;
+  }
+
   private watchAppStateDrops(keys: any) {
     return {
       ...keys,
@@ -4234,7 +4275,14 @@ export class BaileysStartupService extends ChannelStartupService {
             if (versions[name] === null) this.scheduleAppStateHeal(name);
           }
         }
-        return keys.set(data);
+        const out = await keys.set(data);
+        const syncKeys = data?.['app-state-sync-key'];
+        const nr = this.appStateNotReady;
+        if (nr && syncKeys) {
+          const arrived = Object.keys(syncKeys).find((id) => syncKeys[id] && nr.absent.has(id));
+          if (arrived) this.clearAppStateNotReady(`missing key ${arrived} arrived`);
+        }
+        return out;
       },
     };
   }
@@ -4261,19 +4309,38 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     if (!dropped.length) return; // Baileys recovered on its own (retry from scratch worked)
     let keysBad = false;
+    const badIds: string[] = [];
     for (const name of dropped) {
       try {
         const scan = await this.scanAppStateKeys(name);
         if (scan.total.bad + scan.total.missing > 0) keysBad = true;
+        for (const [id, s] of Object.entries(scan.stats)) if (s.bad + s.missing > 0) badIds.push(id);
         this.logger.warn(`app-state heal: ${name} was dropped by Baileys; key check ${JSON.stringify(scan.total)}`);
       } catch (error) {
         this.logger.warn(`app-state heal: scan ${name} failed: ${error}`);
       }
     }
-    if (keysBad && Date.now() - this.appStateLastKeyRequest > 10 * 60_000) {
+    // darnabt 2026-11-18: the phone already said it has no more keys -> no re-ask (and no v0 resync) for 6 h
+    // unless a key id we never asked about went missing
+    const nr = this.appStateNotReady;
+    const newIds = badIds.filter((id) => !nr?.seen.has(id));
+    const onHold = keysBad && !!this.appStateNotReadyError() && !newIds.length;
+    if (onHold) {
+      dropped.forEach((name) => nr.collections.add(name));
+      this.logger.warn(
+        `app-state heal: same ${badIds.length} key id(s) still unreadable — not asking the phone again until ${new Date(
+          nr.at + this.appStateReaskMs,
+        ).toISOString()}`,
+      );
+    }
+    if (keysBad && !onHold && Date.now() - this.appStateLastKeyRequest > 10 * 60_000) {
       this.appStateLastKeyRequest = Date.now();
-      const r: any = await this.requestAppStateKeys({ waitSeconds: 30 });
+      const r: any = await this.requestAppStateKeys({ waitSeconds: 30, auto: true });
       this.logger.warn(`app-state heal: key re-request ok=${r?.ok} resync=${JSON.stringify(r?.resync ?? {})}`);
+      if (!(r?.keysChanged > 0) && this.appStateNotReady) {
+        dropped.forEach((name) => this.appStateNotReady.collections.add(name));
+        badIds.forEach((id) => this.appStateNotReady.seen.add(id));
+      }
       return;
     }
     const getKey = async (id: string) => (await keys.get('app-state-sync-key', [id]))[id];
@@ -4487,6 +4554,10 @@ export class BaileysStartupService extends ChannelStartupService {
     if (!myAppStateKeyId) {
       throw new Error('App state key not present on this linked device');
     }
+    // darnabt 2026-11-18: keys known missing for this collection -> answer the caller at once; no resync,
+    // no rebuild, no re-ask (each of those re-downloads the collection and can trigger the heal storm)
+    const notReady = this.appStateNotReadyError(name);
+    if (notReady) throw new Error(notReady);
     const getKey = async (id: string) => (await keys.get('app-state-sync-key', [id]))[id];
 
     let lastError = '';
@@ -4511,11 +4582,21 @@ export class BaileysStartupService extends ChannelStartupService {
         // wrong / missing app-state key -> ask our own phone for the keys once, then retry
         if (!keysRequested && /decrypt|failed to find key|MISMATCH|check key missing/i.test(lastError)) {
           keysRequested = true;
+          // darnabt 2026-11-18: the phone was asked within 6 h and had nothing new -> fail now, do not re-ask
+          const onHold = this.appStateNotReadyError();
+          if (onHold) {
+            this.appStateNotReady.collections.add(name);
+            throw new Error(onHold);
+          }
           this.logger.warn(`app-state ${name}: ${lastError} -> re-requesting keys from the phone`);
-          await this.requestAppStateKeys({ waitSeconds: 25 }).catch((e) =>
-            this.logger.warn(`app-state key re-request failed: ${e}`),
-          );
-          continue;
+          const r: any = await this.requestAppStateKeys({ waitSeconds: 25, auto: true }).catch((e) => {
+            this.logger.warn(`app-state key re-request failed: ${e}`);
+            return null;
+          });
+          // only new keys can change the rebuild; otherwise answer «app state not ready» instead of retrying
+          if (r?.keysChanged > 0) continue;
+          this.appStateNotReady?.collections.add(name);
+          throw new Error(this.appStateNotReadyError(name) ?? `app state not ready: ${lastError}`);
         }
         throw error;
       }
@@ -4688,7 +4769,14 @@ export class BaileysStartupService extends ChannelStartupService {
   // the same one WhatsApp Web sends; never a chat message. Baileys stores the keys from the
   // phone's APP_STATE_SYNC_KEY_SHARE answer itself; then every collection is resynced from
   // its server snapshot. The reply says plainly whether the phone answered and what synced.
-  public async requestAppStateKeys(data: { collections?: string[]; keyIds?: string[]; waitSeconds?: number }) {
+  // auto: called by the bridge itself (heal / before a patch): when the phone shares no new key, skip the
+  // resync of every collection from v0 (it would replay thousands of events and change nothing)
+  public async requestAppStateKeys(data: {
+    collections?: string[];
+    keyIds?: string[];
+    waitSeconds?: number;
+    auto?: boolean;
+  }) {
     const sock: any = this.client;
     if (!sock?.authState?.creds?.me?.id || this.stateConnection?.state !== 'open') {
       throw new BadRequestException('Instance is not connected');
@@ -4767,6 +4855,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     const fpAfter = await fingerprint();
     const changed = keyIds.filter((id) => fpBefore[id] !== fpAfter[id]);
+    const stillMissing = keyIds.filter((id) => !fpAfter[id]);
     const answer = {
       requestId,
       requestedKeyIds: keyIds.length,
@@ -4774,11 +4863,19 @@ export class BaileysStartupService extends ChannelStartupService {
       waitedSeconds: Math.round((Date.now() - startedAt) / 1000),
       sharedKeyIds: shared.length,
       keysChanged: changed.length,
+      stillMissing: stillMissing.length,
       myAppStateKeyId: { before: myKeyIdBefore, after: sock.authState.creds.myAppStateKeyId },
     };
     this.logger.warn(`app-state key request result: ${JSON.stringify(answer)}`);
+    // darnabt 2026-11-18: no new key -> hold further asks for 6 h (see appStateNotReady); new keys -> clear the hold
+    if (changed.length) this.clearAppStateNotReady(`the phone shared ${changed.length} new key(s)`);
+    else this.markAppStateNotReady(stillMissing);
     if (!shares && !changed.length) {
       return { ok: false, ...answer, before, message: 'The phone did not answer the key request; nothing was changed.' };
+    }
+    if (data?.auto && !changed.length) {
+      this.logger.warn(`app-state key request: no new keys — not resyncing from v0 (app state not ready)`);
+      return { ok: false, ...answer, before, message: 'The phone shared no new keys; no resync (app state not ready).' };
     }
 
     // 3. resync every collection from its server snapshot with the fresh keys
