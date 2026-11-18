@@ -644,8 +644,7 @@ export class BaileysStartupService extends ChannelStartupService {
     let browserOptions = {};
 
     if (number || this.phoneNumber) {
-      this.phoneNumber = number;
-
+      // darnabt: this.phoneNumber is set at the end, only by the attempt that builds the socket
       this.logger.info(`Phone number: ${number}`);
     } else {
       const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
@@ -773,6 +772,10 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
+
+    // darnabt: say 'connecting' at once (no await since the generation check), so a watchdog
+    // /instance/connect in the gap before the socket's own 'connecting' event never builds a second socket
+    this.stateConnection = { state: 'connecting', statusReason: 200 };
 
     this.eventHandler();
 
@@ -2220,8 +2223,23 @@ export class BaileysStartupService extends ChannelStartupService {
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
+
+            // darnabt: the connection and the login are handled before the settings read, so a slow or
+            // down database can never drop a 'close' (no retry would start) or an 'open'/'connecting'
+            if (events['connection.update']) {
+              this.connectionUpdate(events['connection.update']);
+            }
+
+            if (events['creds.update']) {
+              this.instance.authState.saveCreds();
+            }
+
             this.eventBatchStep = 'findSettings';
-            const settings = await this.findSettings();
+            // darnabt: a failed settings read falls back to the last loaded settings instead of dropping the batch
+            const settings = await this.findSettings().catch((e) => {
+              this.logger.warn(`findSettings failed, using last loaded settings: ${e?.message ?? e}`);
+              return { ...this.localSettings };
+            });
 
             if (events.call) {
               const call = events.call[0];
@@ -2240,14 +2258,6 @@ export class BaileysStartupService extends ChannelStartupService {
               }
 
               this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
             }
 
             if (events['messaging-history.set']) {
