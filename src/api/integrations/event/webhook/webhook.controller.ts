@@ -31,7 +31,7 @@ export class WebhookController extends EventController implements EventControlle
       }
     }
 
-    return this.prisma.webhook.upsert({
+    const result = await this.prisma.webhook.upsert({
       where: {
         instanceId: this.monitor.waInstances[instanceName].instanceId,
       },
@@ -53,6 +53,10 @@ export class WebhookController extends EventController implements EventControlle
         webhookByEvents: data.webhook.byEvents,
       },
     });
+
+    this.invalidate(instanceName);
+
+    return result;
   }
 
   public async emit({

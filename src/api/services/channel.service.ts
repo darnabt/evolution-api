@@ -37,6 +37,14 @@ export class ChannelStartupService {
   public readonly localProxy: wa.LocalProxy = {};
   public readonly localSettings: wa.LocalSettings = {};
   public readonly localWebhook: wa.LocalWebHook = {};
+  // darnabt 2026-11-18: findSettings() ran once per Baileys event batch (≈3,000 reads per reconnect replay).
+  // Kept in memory: read once, reused; dropped by setSettings / loadSettings / logout and after 5 min.
+  private static readonly SETTINGS_CACHE_TTL_MS = 5 * 60 * 1000;
+  private settingsCache: { row: Promise<any>; at: number } | null = null;
+
+  public invalidateSettingsCache() {
+    this.settingsCache = null;
+  }
 
   public chatwootService = new ChatwootService(
     waMonitor,
@@ -140,6 +148,7 @@ export class ChannelStartupService {
   }
 
   public async loadSettings() {
+    this.invalidateSettingsCache();
     const data = await this.prismaRepository.setting.findUnique({
       where: {
         instanceId: this.instanceId,
@@ -184,6 +193,8 @@ export class ChannelStartupService {
       },
     });
 
+    this.invalidateSettingsCache();
+
     this.localSettings.rejectCall = data?.rejectCall;
     this.localSettings.msgCall = data?.msgCall;
     this.localSettings.groupsIgnore = data?.groupsIgnore;
@@ -200,11 +211,38 @@ export class ChannelStartupService {
   }
 
   public async findSettings() {
-    const data = await this.prismaRepository.setting.findUnique({
-      where: {
-        instanceId: this.instanceId,
-      },
-    });
+    let data: any;
+    let fromCache = false;
+
+    try {
+      const hit = this.settingsCache;
+      if (hit && Date.now() - hit.at < ChannelStartupService.SETTINGS_CACHE_TTL_MS) {
+        data = await hit.row;
+        fromCache = true;
+      }
+    } catch {
+      // cache error -> fall back to today's direct read below
+      this.settingsCache = null;
+    }
+
+    if (!fromCache) {
+      const read: Promise<any> = Promise.resolve(
+        this.prismaRepository.setting.findUnique({
+          where: {
+            instanceId: this.instanceId,
+          },
+        }),
+      );
+      const entry = { row: read, at: Date.now() };
+      this.settingsCache = entry;
+      read.catch(() => {
+        if (this.settingsCache === entry) {
+          this.settingsCache = null;
+        }
+      });
+
+      data = await read;
+    }
 
     if (!data) {
       return null;
