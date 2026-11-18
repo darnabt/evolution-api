@@ -96,6 +96,7 @@ export class PusherController extends EventController implements EventController
         useTLS: data.pusher.useTLS,
       },
     });
+    this.invalidate(instanceName);
     if (instance.enabled && instance.appId && instance.key && instance.secret && instance.cluster) {
       this.pusherClients[instanceName] = new Pusher({
         appId: instance.appId,
