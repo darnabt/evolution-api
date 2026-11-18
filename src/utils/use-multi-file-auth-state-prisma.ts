@@ -25,22 +25,21 @@ export async function keyExists(sessionId: string): Promise<any> {
   }
 }
 
-export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
-  const exists = await keyExists(sessionId);
+// darnabt 2026-11-18 (scan study F1): one upsert instead of exists + create/update. Before, a failed exists
+// read answered "no row", the create then hit the unique key and the error was swallowed: the creds update
+// (prekey counters, app-state key id) was lost without a line. Now it answers true/false and logs the reason.
+export async function saveKey(sessionId: string, keyJson: any): Promise<boolean> {
   try {
-    if (!exists)
-      return await prismaRepository.session.create({
-        data: {
-          sessionId: sessionId,
-          creds: JSON.stringify(keyJson),
-        },
-      });
-    await prismaRepository.session.update({
+    const creds = JSON.stringify(keyJson);
+    await prismaRepository.session.upsert({
       where: { sessionId: sessionId },
-      data: { creds: JSON.stringify(keyJson) },
+      create: { sessionId: sessionId, creds },
+      update: { creds },
     });
-  } catch {
-    return null;
+    return true;
+  } catch (error) {
+    logger.warn(`creds save failed: sessionId=${sessionId} reason=${error?.message ?? error}`);
+    return false;
   }
 }
 
@@ -76,6 +75,66 @@ async function fileExists(file: string): Promise<any> {
 
 const logger = new Logger('useMultiFileAuthStatePrisma');
 
+// darnabt 2026-11-18 (scan study F1): a key file is written to a temp name and renamed over the real one, so a
+// SIGTERM / crash mid-write (every deploy) can never leave a half-written file that reads back as "missing"
+// (Bad MAC, "app-state key missing"). The temp name never matches a key name, so a leftover is never read.
+async function writeFileAtomic(file: string, dataString: string) {
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    await fs.writeFile(tmp, dataString);
+    await fs.rename(tmp, file);
+  } catch (error) {
+    await fs.unlink(tmp).catch(() => undefined);
+    throw error;
+  }
+}
+
+// darnabt 2026-11-18 (scan study F1): creds saves go through ONE writer per instance (shared by every auth
+// state built for it, so an old socket's save and a new socket's save never race) that always writes the
+// NEWEST creds. A save that fails (database down) is retried (2 s, 4 s … max 30 s, ~12 min in all) instead of
+// being dropped, and a newer save replaces the pending one, so an old retry can never land after a newer save.
+// The same creds are mirrored to <instance>/creds.json (atomic) as a copy that survives a lost row; it is NOT
+// read back by the bridge. A logout (removeCreds) drops whatever is still pending.
+const credsPending = new Map<string, string>();
+const credsWriter = new Map<string, Promise<void>>();
+
+function saveCredsLatest(sessionId: string, dataString: string, mirrorFile: string): Promise<void> {
+  credsPending.set(sessionId, dataString);
+  writeFileAtomic(mirrorFile, dataString).catch((error) =>
+    logger.warn(`creds file mirror failed: sessionId=${sessionId} reason=${error?.message ?? error}`),
+  );
+  const running = credsWriter.get(sessionId);
+  if (running) return running;
+  const writer = (async () => {
+    let failures = 0;
+    while (credsPending.has(sessionId)) {
+      const current = credsPending.get(sessionId);
+      if (await saveKey(sessionId, current)) {
+        if (credsPending.get(sessionId) === current) credsPending.delete(sessionId);
+        if (failures) logger.warn(`creds saved after ${failures} failed tries: sessionId=${sessionId}`);
+        failures = 0;
+      } else {
+        failures++;
+        if (failures === 5) logger.error(`creds save still failing after 5 tries, still retrying: sessionId=${sessionId}`);
+        if (failures >= 30) {
+          // e.g. the instance row was deleted; the next creds.update carries the whole newest creds again
+          logger.error(`creds save gave up after ${failures} tries: sessionId=${sessionId}`);
+          if (credsPending.get(sessionId) === current) credsPending.delete(sessionId);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(failures * 2000, 30_000)));
+      }
+    }
+  })().finally(() => {
+    credsWriter.delete(sessionId);
+    // a save that came in after the loop's last check (or after it gave up) is not left unsaved
+    const late = credsPending.get(sessionId);
+    if (late !== undefined) saveCredsLatest(sessionId, late, mirrorFile);
+  });
+  credsWriter.set(sessionId, writer);
+  return writer;
+}
+
 export default async function useMultiFileAuthStatePrisma(
   sessionId: string,
   cache: CacheService,
@@ -96,13 +155,13 @@ export default async function useMultiFileAuthStatePrisma(
       if (cacheConfig.REDIS.ENABLED) {
         return await cache.hSet(sessionId, key, data);
       } else {
-        await fs.writeFile(localFile(key), dataString);
+        await writeFileAtomic(localFile(key), dataString);
         return;
       }
     }
     // darnabt: never write empty creds over a saved login.
     if (!data) return;
-    await saveKey(sessionId, dataString);
+    await saveCredsLatest(sessionId, dataString, localFile('creds'));
     return;
   }
 
@@ -117,7 +176,18 @@ export default async function useMultiFileAuthStatePrisma(
         } else {
           if (!(await fileExists(localFile(key)))) return null;
           rawData = await fs.readFile(localFile(key), { encoding: 'utf-8' });
-          return JSON.parse(rawData, BufferJSON.reviver);
+          try {
+            return JSON.parse(rawData, BufferJSON.reviver);
+          } catch (error) {
+            // darnabt 2026-11-18 (scan study F1): a file that exists but cannot be parsed is said out loud
+            // (name and size only, never the content) instead of silently reading as "missing"
+            logger.warn(
+              `auth key file unreadable: sessionId=${sessionId} key=${key.replace(/\d{5,}/g, '…')} bytes=${rawData?.length ?? 0} reason=${
+                error?.message ?? error
+              }`,
+            );
+            return null;
+          }
         }
       } else {
         rawData = await getAuthKey(sessionId);
@@ -165,6 +235,8 @@ export default async function useMultiFileAuthStatePrisma(
 
     logger.info({ action: 'auth.key.delete', sessionId });
 
+    // darnabt 2026-11-18: a creds save still retrying must not write the logged-out creds back after this delete
+    credsPending.delete(sessionId);
     await deleteAuthKey(sessionId);
   }
 
