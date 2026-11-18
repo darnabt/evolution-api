@@ -1391,7 +1391,10 @@ export class BaileysStartupService extends ChannelStartupService {
         }
         if (chatsUnread.length) console.log(`history chats unread: ${chatsUnread.length} chats carry the phone's unread`);
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
+        // darnabt 2026-11-18 (history flag) — each history row says it is history: upsertType "history-sync".
+        // A copy per row: messagesRaw itself is saved below (Prisma refuses unknown columns). Nothing else changes.
+        const historyRows = messagesRaw.map((m) => ({ ...m, upsertType: 'history-sync' }));
+        this.sendDataWebhook(Events.MESSAGES_SET, historyRows, true, undefined, {
           isLatest,
           progress,
           ...(chatsUnread.length ? { chatsUnread } : {}),
@@ -1829,7 +1832,13 @@ export class BaileysStartupService extends ChannelStartupService {
           }
           console.log(messageRaw);
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+          // darnabt 2026-11-18 (history flag) — Baileys' upsert type as received, on the webhook row only (a copy:
+          // messageRaw is saved / handed to chatbots unchanged). Baileys 7.0.0-rc.9: "notify" = delivered live
+          // (incl. our phone's own sends, a placeholder resend); "append" = WhatsApp's OFFLINE queue flushed after a
+          // reconnect (node.attrs.offline), a notification turned into a message, a newsletter plaintext, an offline
+          // call — all NEW events that may arrive late. History never comes here (messaging-history.set → messages.set,
+          // marked "history-sync"). A batch flushed by Baileys' event buffer carries ONE type, the first message's.
+          this.sendDataWebhook(Events.MESSAGES_UPSERT, { ...messageRaw, upsertType: type });
 
           this.eventBatchStep = 'messages.upsert:chatbot';
           await chatbotController.emit({
