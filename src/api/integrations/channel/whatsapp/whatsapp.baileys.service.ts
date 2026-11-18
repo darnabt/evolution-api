@@ -734,11 +734,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const isGroupJid = this.localSettings.groupsIgnore && isJidGroup(jid);
-        // darnabt 2026-11-18: status@broadcast is NEVER ignored here. Baileys answers an ignored message with a
-        // NACK 500 (messages-recv handleMessage), and WhatsApp ends the stream on that nack about every 50 min
-        // ("Stream Errored (ack)" class:"status"). Baileys now acks statuses normally; with readStatus off they
-        // are dropped from every event batch in eventHandler (withoutStatusBroadcast), so nothing else changes.
-        const isBroadcast = !this.localSettings.readStatus && isJidBroadcast(jid) && jid !== 'status@broadcast';
+        const isBroadcast = !this.localSettings.readStatus && isJidBroadcast(jid);
         const isNewsletter = isJidNewsletter(jid);
 
         return isGroupJid || isBroadcast || isNewsletter;
@@ -2221,43 +2217,8 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  /**
-   * darnabt 2026-11-18: with readStatus off, statuses (status@broadcast) are taken out of the batch before any
-   * handler sees it — no webhook, no DB row, no read receipt, no chat row — exactly as when Baileys ignored them.
-   * Only status@broadcast items are removed; every other event and item (connection, creds, real chats) is kept.
-   * Returns a copy; the batch Baileys handed over is not changed.
-   */
-  private withoutStatusBroadcast(events: any): any {
-    if (this.localSettings?.readStatus) return events;
-    const isStatus = (jid: unknown) => jid === 'status@broadcast';
-    let out = events;
-    const set = (name: string, value: any) => {
-      if (out === events) out = { ...events };
-      if (value === undefined) delete out[name];
-      else out[name] = value;
-    };
-    const up = events['messages.upsert'];
-    if (Array.isArray(up?.messages) && up.messages.some((m: any) => isStatus(m?.key?.remoteJid))) {
-      const kept = up.messages.filter((m: any) => !isStatus(m?.key?.remoteJid));
-      set('messages.upsert', kept.length ? { ...up, messages: kept } : undefined);
-    }
-    const byKey = ['messages.update', 'message-receipt.update'];
-    const byId = ['chats.upsert', 'chats.update'];
-    for (const name of [...byKey, ...byId]) {
-      const list = events[name];
-      if (!Array.isArray(list)) continue;
-      const jidOf = (e: any) => (byKey.includes(name) ? e?.key?.remoteJid : e?.id);
-      if (!list.some((e: any) => isStatus(jidOf(e)))) continue;
-      const kept = list.filter((e: any) => !isStatus(jidOf(e)));
-      set(name, kept.length ? kept : undefined);
-    }
-    return out;
-  }
-
   private eventHandler() {
-    this.client.ev.process(async (incoming) => {
-      const events = this.withoutStatusBroadcast(incoming);
-      if (Object.keys(events).length === 0) return;
+    this.client.ev.process(async (events) => {
       const work = async () => {
         try {
           if (!this.endSession) {
