@@ -268,6 +268,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  // darnabt 2026-11-18: each reconnect replays the whole address book (contacts.upsert / contacts.update for
+  // every contact). Remember what was last sent per contact; a replayed, unchanged contact is not sent again.
+  private readonly sentContactFingerprints = new Map<string, string>();
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -282,6 +285,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.sentContactFingerprints.clear();
+    this.invalidateSettingsCache();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -898,9 +903,53 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  private contactFingerprint(contact: Partial<Contact>): string {
+    return JSON.stringify([
+      contact?.name ?? null,
+      contact?.notify ?? null,
+      contact?.verifiedName ?? null,
+      contact?.imgUrl ?? null,
+    ]);
+  }
+
+  // Keeps only contacts that are new or changed since they were last sent (per event kind).
+  private onlyChangedContacts<T extends Partial<Contact>>(kind: 'upsert' | 'update', contacts: T[]): T[] {
+    try {
+      return contacts.filter((contact) => {
+        if (!contact?.id) {
+          return true;
+        }
+        // a picture-change marker always goes out
+        if (kind === 'update' && contact.imgUrl !== undefined) {
+          return true;
+        }
+        return this.sentContactFingerprints.get(`${kind}:${contact.id}`) !== this.contactFingerprint(contact);
+      });
+    } catch {
+      return contacts;
+    }
+  }
+
+  private rememberSentContacts(kind: 'upsert' | 'update', contacts: Partial<Contact>[]) {
+    try {
+      for (const contact of contacts) {
+        if (contact?.id) {
+          this.sentContactFingerprints.set(`${kind}:${contact.id}`, this.contactFingerprint(contact));
+        }
+      }
+    } catch {
+      // memory only — nothing to undo
+    }
+  }
+
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        contacts = this.onlyChangedContacts('upsert', contacts || []);
+        if (contacts.length === 0) {
+          return;
+        }
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
           pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
@@ -981,6 +1030,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }),
           );
         }
+
+        this.rememberSentContacts('upsert', contacts);
       } catch (error) {
         console.error(error);
         this.logger.error(`Error: ${error.message}`);
@@ -988,6 +1039,11 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
+      contacts = this.onlyChangedContacts('update', contacts || []);
+      if (contacts.length === 0) {
+        return;
+      }
+
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
@@ -1011,6 +1067,8 @@ export class BaileysStartupService extends ChannelStartupService {
         );
         await this.prismaRepository.$transaction(updateTransactions);
       }
+
+      this.rememberSentContacts('update', contacts);
 
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
