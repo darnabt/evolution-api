@@ -930,11 +930,37 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private rememberSentContacts(kind: 'upsert' | 'update', contacts: Partial<Contact>[]) {
+  // Stored at send time (before any await), so a batch that finishes late can never overwrite a newer fingerprint.
+  // The other kind's key for the same id is dropped unless it holds the same fingerprint, so a stale fingerprint of
+  // the other kind can never hide a real change: that contact goes out once on the next replay.
+  private rememberSentContacts(kind: 'upsert' | 'update', contacts: Partial<Contact>[]): [string, string][] {
+    const sent: [string, string][] = [];
     try {
+      const otherKind = kind === 'upsert' ? 'update' : 'upsert';
       for (const contact of contacts) {
         if (contact?.id) {
-          this.sentContactFingerprints.set(`${kind}:${contact.id}`, this.contactFingerprint(contact));
+          const key = `${kind}:${contact.id}`;
+          const fingerprint = this.contactFingerprint(contact);
+          this.sentContactFingerprints.set(key, fingerprint);
+          sent.push([key, fingerprint]);
+          const otherKey = `${otherKind}:${contact.id}`;
+          if (this.sentContactFingerprints.get(otherKey) !== fingerprint) {
+            this.sentContactFingerprints.delete(otherKey);
+          }
+        }
+      }
+    } catch {
+      // memory only — nothing to undo
+    }
+    return sent;
+  }
+
+  // The send failed: drop what it stored, unless a newer batch has already replaced it.
+  private forgetSentContacts(sent: [string, string][]) {
+    try {
+      for (const [key, fingerprint] of sent) {
+        if (this.sentContactFingerprints.get(key) === fingerprint) {
+          this.sentContactFingerprints.delete(key);
         }
       }
     } catch {
@@ -944,11 +970,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
+      let sent: [string, string][] = [];
       try {
         contacts = this.onlyChangedContacts('upsert', contacts || []);
         if (contacts.length === 0) {
           return;
         }
+        sent = this.rememberSentContacts('upsert', contacts);
 
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
@@ -1030,9 +1058,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }),
           );
         }
-
-        this.rememberSentContacts('upsert', contacts);
       } catch (error) {
+        this.forgetSentContacts(sent);
         console.error(error);
         this.logger.error(`Error: ${error.message}`);
       }
@@ -1043,32 +1070,37 @@ export class BaileysStartupService extends ChannelStartupService {
       if (contacts.length === 0) {
         return;
       }
+      const sent = this.rememberSentContacts('update', contacts);
 
-      const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
-      for await (const contact of contacts) {
-        this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
-        contactsRaw.push({
-          remoteJid: contact.id,
-          pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-          instanceId: this.instanceId,
-        });
+      try {
+        const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] =
+          [];
+        for await (const contact of contacts) {
+          this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
+          contactsRaw.push({
+            remoteJid: contact.id,
+            pushName: contact?.name ?? contact?.verifiedName,
+            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+            instanceId: this.instanceId,
+          });
+        }
+
+        this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
+
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+          const updateTransactions = contactsRaw.map((contact) =>
+            this.prismaRepository.contact.upsert({
+              where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
+              create: contact,
+              update: contact,
+            }),
+          );
+          await this.prismaRepository.$transaction(updateTransactions);
+        }
+      } catch (error) {
+        this.forgetSentContacts(sent);
+        throw error;
       }
-
-      this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
-
-      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-        const updateTransactions = contactsRaw.map((contact) =>
-          this.prismaRepository.contact.upsert({
-            where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-            create: contact,
-            update: contact,
-          }),
-        );
-        await this.prismaRepository.$transaction(updateTransactions);
-      }
-
-      this.rememberSentContacts('update', contacts);
 
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
