@@ -464,6 +464,22 @@ export class WAMonitoringService {
       } finally {
         this.logger.warn(`Instance "${instanceName}" - NOT CONNECTION`);
       }
+
+      // darnabt: the QR limit was reached and nobody scanned, so this number has no login. Every QR wrote
+      // connectionStatus 'connecting' to the database; left there, the next bridge start auto-connects it and runs
+      // another unattended QR loop (WhatsApp ends each unscanned QR socket after ~3.5 min → 428 → reconnect, 12
+      // times). Record 'close' so a boot skips it until someone asks for a QR again.
+      try {
+        if (this.db.SAVE_DATA.INSTANCE) {
+          await this.prismaRepository.instance.updateMany({
+            where: { name: instanceName, connectionStatus: 'connecting' },
+            data: { connectionStatus: 'close' },
+          });
+          this.logger.warn(`Instance "${instanceName}" - QR limit reached, saved as close`);
+        }
+      } catch (error) {
+        this.logger.error(`Instance "${instanceName}" - could not save close after QR limit: ${error?.message ?? error}`);
+      }
     });
   }
 }
