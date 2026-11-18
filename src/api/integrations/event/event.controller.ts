@@ -39,6 +39,10 @@ export class EventController {
   protected waMonitor: WAMonitoringService;
   private integrationStatus: boolean;
   private integrationName: string;
+  // darnabt 2026-11-18: emit() read this config row from the database for EVERY event (≈4,500 reads per
+  // reconnect replay). Kept per instance in memory: read once, reused; dropped on every set() and after 5 min.
+  private static readonly ROW_CACHE_TTL_MS = 5 * 60 * 1000;
+  private readonly rowCache = new Map<string, { row: Promise<any>; at: number }>();
 
   constructor(
     prismaRepository: PrismaRepository,
@@ -97,7 +101,7 @@ export class EventController {
       }
     }
 
-    return this.prisma[this.name].upsert({
+    const result = await this.prisma[this.name].upsert({
       where: {
         instanceId: this.monitor.waInstances[instanceName].instanceId,
       },
@@ -111,6 +115,24 @@ export class EventController {
         instanceId: this.monitor.waInstances[instanceName].instanceId,
       },
     });
+
+    this.invalidate(instanceName);
+
+    return result;
+  }
+
+  // darnabt 2026-11-18: drop the cached row of one instance (or all when the name is unknown).
+  public invalidate(instanceName?: string): void {
+    try {
+      const instanceId = instanceName ? this.monitor.waInstances[instanceName]?.instanceId : undefined;
+      if (instanceId) {
+        this.rowCache.delete(instanceId);
+      } else {
+        this.rowCache.clear();
+      }
+    } catch {
+      this.rowCache.clear();
+    }
   }
 
   public async get(instanceName: string): Promise<wa.LocalEvent> {
@@ -122,11 +144,43 @@ export class EventController {
       return null;
     }
 
-    const data = await this.prisma[this.name].findUnique({
-      where: {
-        instanceId: this.monitor.waInstances[instanceName].instanceId,
-      },
-    });
+    const instanceId: string = this.monitor.waInstances[instanceName].instanceId;
+
+    if (instanceId) {
+      try {
+        const hit = this.rowCache.get(instanceId);
+        if (hit && Date.now() - hit.at < EventController.ROW_CACHE_TTL_MS) {
+          const cached = await hit.row;
+          if (!cached) {
+            return null;
+          }
+          return cached;
+        }
+      } catch {
+        // cache error -> fall back to today's direct read below
+        this.rowCache.delete(instanceId);
+      }
+    }
+
+    const read: Promise<any> = Promise.resolve(
+      this.prisma[this.name].findUnique({
+        where: {
+          instanceId: this.monitor.waInstances[instanceName].instanceId,
+        },
+      }),
+    );
+
+    if (instanceId) {
+      const entry = { row: read, at: Date.now() };
+      this.rowCache.set(instanceId, entry);
+      read.catch(() => {
+        if (this.rowCache.get(instanceId) === entry) {
+          this.rowCache.delete(instanceId);
+        }
+      });
+    }
+
+    const data = await read;
 
     if (!data) {
       return null;

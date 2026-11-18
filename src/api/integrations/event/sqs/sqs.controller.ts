@@ -81,7 +81,11 @@ export class SqsController extends EventController implements EventControllerInt
     };
 
     console.log('*** payload: ', payload);
-    return this.prisma[this.name].upsert(payload);
+    const result = await this.prisma[this.name].upsert(payload);
+
+    this.invalidate(instanceName);
+
+    return result;
   }
 
   public async emit({
