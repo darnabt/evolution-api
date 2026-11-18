@@ -4229,21 +4229,24 @@ export class BaileysStartupService extends ChannelStartupService {
   private appStateHealPending = new Set<string>();
   private appStateLastKeyRequest = 0;
 
-  // darnabt 2026-11-18 (heal storm): the phone was asked for the app-state keys and shared nothing new.
-  // While that holds, the bridge does not ask again (nor resync every collection from v0) for 6 h unless a
-  // NEW key id goes missing, and a patch on a collection that failed (mark read/unread, pin…) fails at once
-  // with «app state not ready» instead of resync + rebuild + re-ask on every call. Cleared when one of the
-  // absent keys arrives or an ask brings new keys. In memory only: a restart costs at most one extra ask.
-  private appStateNotReady: { absent: Set<string>; seen: Set<string>; collections: Set<string>; at: number } | null =
-    null;
+  // darnabt 2026-11-18 (heal storm): the phone ANSWERED a key request, shared no new key, and keys are still
+  // missing. While that holds (6 h), the bridge does not ask again (nor resync every collection from v0)
+  // unless a key id it never asked about goes missing. Set only when the phone answered and at least one key
+  // is still missing, so a missing key's arrival can always lift it. Cleared when one of the absent keys
+  // arrives, an ask brings new keys, or an answered ask finds nothing missing. In memory only: a restart
+  // costs at most one extra ask.
+  private appStateNotReady: { absent: Set<string>; seen: Set<string>; at: number } | null = null;
   private readonly appStateReaskMs = 6 * 60 * 60_000;
+  // collections whose LAST rebuild failed for a key reason (records need a key we lack, or our own key cannot
+  // decrypt). Only these are blocked by the hold; a rebuild that succeeds (or fails for another reason) lifts it.
+  private appStateKeyFailed = new Set<string>();
 
-  private markAppStateNotReady(absent: string[]) {
-    const prev = this.appStateNotReady;
+  private markAppStateNotReady(absent: string[], asked: string[]) {
+    const prev = this.appStateNotReadyError() ? this.appStateNotReady : null;
     this.appStateNotReady = {
       absent: new Set(absent),
-      seen: new Set(absent),
-      collections: new Set(prev?.collections ?? []),
+      // every id already asked about while the hold is on, so the next heal does not take them for new ones
+      seen: new Set([...(prev?.seen ?? []), ...asked, ...absent]),
       at: Date.now(),
     };
   }
@@ -4254,11 +4257,12 @@ export class BaileysStartupService extends ChannelStartupService {
     this.logger.warn(`app-state: ${reason} — app state may be ready again, the next change will try`);
   }
 
-  // the «app state not ready» text while the 6 h hold is on (for one collection, or for any when name is omitted)
+  // the «app state not ready» text while the 6 h hold is on. With a name: only when that collection's last
+  // rebuild failed for a key reason. Without a name: whenever the hold is on (used to skip re-asks).
   private appStateNotReadyError(name?: string): string | null {
     const nr = this.appStateNotReady;
     if (!nr || Date.now() - nr.at >= this.appStateReaskMs) return null;
-    if (name !== undefined && !nr.collections.has(name)) return null;
+    if (name !== undefined && !this.appStateKeyFailed.has(name)) return null;
     return `app state not ready: ${nr.absent.size} app-state key(s) missing on this linked device and the phone shared no new keys when asked at ${new Date(
       nr.at,
     ).toISOString()} — not retrying; next ask after ${new Date(nr.at + this.appStateReaskMs).toISOString()}`;
@@ -4326,7 +4330,6 @@ export class BaileysStartupService extends ChannelStartupService {
     const newIds = badIds.filter((id) => !nr?.seen.has(id));
     const onHold = keysBad && !!this.appStateNotReadyError() && !newIds.length;
     if (onHold) {
-      dropped.forEach((name) => nr.collections.add(name));
       this.logger.warn(
         `app-state heal: same ${badIds.length} key id(s) still unreadable — not asking the phone again until ${new Date(
           nr.at + this.appStateReaskMs,
@@ -4337,8 +4340,7 @@ export class BaileysStartupService extends ChannelStartupService {
       this.appStateLastKeyRequest = Date.now();
       const r: any = await this.requestAppStateKeys({ waitSeconds: 30, auto: true });
       this.logger.warn(`app-state heal: key re-request ok=${r?.ok} resync=${JSON.stringify(r?.resync ?? {})}`);
-      if (!(r?.keysChanged > 0) && this.appStateNotReady) {
-        dropped.forEach((name) => this.appStateNotReady.collections.add(name));
+      if (!(r?.keysChanged > 0) && this.appStateNotReadyError()) {
         badIds.forEach((id) => this.appStateNotReady.seen.add(id));
       }
       return;
@@ -4379,6 +4381,9 @@ export class BaileysStartupService extends ChannelStartupService {
   // app-state key is checked against records it encrypted — if either fails we refuse to
   // upload (an upload would be unreadable for the phone and WhatsApp Web).
   private async rebuildAppStateFromServer(name: string, getKey: (id: string) => Promise<any>) {
+    // darnabt 2026-11-18: only a key failure of THIS rebuild marks the collection (see appStateKeyFailed);
+    // success or any other failure lifts the mark, so a repaired collection is never held
+    this.appStateKeyFailed.delete(name);
     const sock: any = this.client;
     const keys: any = sock.authState.keys;
     const myKeyId: string = sock.authState.creds.myAppStateKeyId;
@@ -4519,6 +4524,7 @@ export class BaileysStartupService extends ChannelStartupService {
     );
     const own = keyStats[myKeyId];
     if (own && own.bad > 0 && own.ok === 0) {
+      this.appStateKeyFailed.add(name);
       throw new Error(
         `this linked device's own app-state key (${myKeyId}) cannot decrypt ${name} records it should own — WhatsApp would not accept our change`,
       );
@@ -4534,6 +4540,8 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.warn(`${name} MAC mismatch accepted (all records clean) — uploading (v${version})`);
       this.appStateMacForced.add(name);
     } else if (macResult === 'MISMATCH' && !(macMatched.length && skippedRemoves === 0)) {
+      // records that need a key we lack make the hash unprovable -> a key failure (the phone may share it later)
+      if (sampled.some((s) => s.missing > 0)) this.appStateKeyFailed.add(name);
       throw new Error(`rebuilt ${name} state does not match WhatsApp's MAC at v${version} — not uploading`);
     } else if (macResult === 'MISMATCH') {
       this.logger.warn(
@@ -4554,8 +4562,9 @@ export class BaileysStartupService extends ChannelStartupService {
     if (!myAppStateKeyId) {
       throw new Error('App state key not present on this linked device');
     }
-    // darnabt 2026-11-18: keys known missing for this collection -> answer the caller at once; no resync,
-    // no rebuild, no re-ask (each of those re-downloads the collection and can trigger the heal storm)
+    // darnabt 2026-11-18: the phone has no more keys AND this collection's last rebuild failed for a key
+    // reason -> answer the caller at once; no resync, no rebuild, no re-ask (each of those re-downloads the
+    // collection and can trigger the heal storm). A collection whose last rebuild succeeded is never blocked.
     const notReady = this.appStateNotReadyError(name);
     if (notReady) throw new Error(notReady);
     const getKey = async (id: string) => (await keys.get('app-state-sync-key', [id]))[id];
@@ -4582,21 +4591,20 @@ export class BaileysStartupService extends ChannelStartupService {
         // wrong / missing app-state key -> ask our own phone for the keys once, then retry
         if (!keysRequested && /decrypt|failed to find key|MISMATCH|check key missing/i.test(lastError)) {
           keysRequested = true;
-          // darnabt 2026-11-18: the phone was asked within 6 h and had nothing new -> fail now, do not re-ask
-          const onHold = this.appStateNotReadyError();
-          if (onHold) {
-            this.appStateNotReady.collections.add(name);
-            throw new Error(onHold);
+          // darnabt 2026-11-18: the phone answered within 6 h with nothing new, or was asked < 10 min ago (same
+          // floor as the heal) -> answer now, do not re-ask
+          if (this.appStateNotReadyError() || Date.now() - this.appStateLastKeyRequest <= 10 * 60_000) {
+            throw new Error(this.appStateNotReadyError(name) ?? lastError);
           }
+          this.appStateLastKeyRequest = Date.now();
           this.logger.warn(`app-state ${name}: ${lastError} -> re-requesting keys from the phone`);
           const r: any = await this.requestAppStateKeys({ waitSeconds: 25, auto: true }).catch((e) => {
             this.logger.warn(`app-state key re-request failed: ${e}`);
             return null;
           });
-          // only new keys can change the rebuild; otherwise answer «app state not ready» instead of retrying
+          // only new keys can change the rebuild; otherwise answer at once instead of retrying
           if (r?.keysChanged > 0) continue;
-          this.appStateNotReady?.collections.add(name);
-          throw new Error(this.appStateNotReadyError(name) ?? `app state not ready: ${lastError}`);
+          throw new Error(this.appStateNotReadyError(name) ?? lastError);
         }
         throw error;
       }
@@ -4867,9 +4875,13 @@ export class BaileysStartupService extends ChannelStartupService {
       myAppStateKeyId: { before: myKeyIdBefore, after: sock.authState.creds.myAppStateKeyId },
     };
     this.logger.warn(`app-state key request result: ${JSON.stringify(answer)}`);
-    // darnabt 2026-11-18: no new key -> hold further asks for 6 h (see appStateNotReady); new keys -> clear the hold
+    // darnabt 2026-11-18: new keys -> clear the hold. The phone ANSWERED with no new key while keys are still
+    // missing -> hold further asks for 6 h (see appStateNotReady). Answered and nothing missing -> no hold
+    // (nothing could ever lift it). No answer (phone offline…) -> no new hold: nothing was learned, and with
+    // no answer there is no v0 resync, so the next ask (10-min floor) costs no burst.
     if (changed.length) this.clearAppStateNotReady(`the phone shared ${changed.length} new key(s)`);
-    else this.markAppStateNotReady(stillMissing);
+    else if (shares && stillMissing.length) this.markAppStateNotReady(stillMissing, keyIds);
+    else if (shares) this.clearAppStateNotReady('the phone answered and no app-state key is missing');
     if (!shares && !changed.length) {
       return { ok: false, ...answer, before, message: 'The phone did not answer the key request; nothing was changed.' };
     }
@@ -4895,6 +4907,7 @@ export class BaileysStartupService extends ChannelStartupService {
         continue;
       }
       const state = (await keys.get('app-state-sync-version', [name]))[name];
+      if (state) this.appStateKeyFailed.delete(name); // Baileys read every record -> no key is missing there
       resync[name] = state ? `synced v${state.version}` : 'FAILED (Baileys dropped it — LOG_BAILEYS=info shows why)';
     }
 
