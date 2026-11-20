@@ -9,7 +9,7 @@ import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
 import { NotFoundException } from '@exceptions';
 import { execFileSync } from 'child_process';
 import EventEmitter2 from 'eventemitter2';
-import { rmSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 import { CacheService } from './cache.service';
@@ -156,6 +156,75 @@ export class WAMonitoringService {
     return this.instanceInfo(instanceNames);
   }
 
+  // darnabt 2026-11-18 (scan study F2): a logout or removal never deletes a login without a copy. The key folder
+  // is MOVED (same volume, one rename) to <INSTANCE_DIR>/_removed/<id>-<time>/ and the creds row is written next
+  // to it as session-row.json, with ended-by.json saying who ended the link (ownLogout = our own logout call,
+  // whatsapp:<code>:<tag> = WhatsApp closed it). The live paths are then empty exactly as before, so a new link
+  // starts clean. Copies older than 7 days (or beyond the newest 5 per instance) are removed. Nothing here ever
+  // throws: a failed move falls back to the old delete, a failed copy is one logged line.
+  private async backupLogin(instanceId: string, instanceName: string, row?: any) {
+    const live = join(INSTANCE_DIR, instanceId);
+    const removedDir = join(INSTANCE_DIR, '_removed');
+    const dest = join(removedDir, `${instanceId}-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+    let endedBy = 'unknown';
+    try {
+      const raw = row?.disconnectionObject;
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+      const code = row?.disconnectionReasonCode;
+      if (text.includes('Log out instance')) endedBy = 'ownLogout';
+      else if (code) {
+        const tag = /"tag":"([^"]+)"/.exec(text)?.[1] ?? '';
+        const type = /"type":"([^"]+)"/.exec(text)?.[1] ?? '';
+        endedBy = `whatsapp:${code}:${tag}${type ? ':' + type : ''}`;
+      }
+    } catch {
+      // keep 'unknown'
+    }
+    try {
+      mkdirSync(dest, { recursive: true, mode: 0o700 });
+      if (existsSync(live)) renameSync(live, join(dest, 'keys'));
+    } catch (error) {
+      this.logger.error(`login backup: move failed for "${instanceName}", deleting as before: ${error?.message ?? error}`);
+      rmSync(live, { recursive: true, force: true });
+    }
+    try {
+      writeFileSync(
+        join(dest, 'ended-by.json'),
+        JSON.stringify({ instanceName, instanceId, endedBy, at: new Date().toISOString() }),
+        { mode: 0o600 },
+      );
+      const session = await this.prismaRepository.session.findUnique({ where: { sessionId: instanceId } });
+      if (session?.creds) writeFileSync(join(dest, 'session-row.json'), session.creds, { mode: 0o600 });
+      this.logger.warn(
+        `login backup: "${instanceName}" kept in _removed/${dest.split('/').pop()} (ended by: ${endedBy}, creds row ${
+          session?.creds ? 'copied' : 'not present'
+        })`,
+      );
+    } catch (error) {
+      this.logger.error(`login backup: creds copy failed for "${instanceName}": ${error?.message ?? error}`);
+    }
+    try {
+      const keepMs = 7 * 24 * 60 * 60_000;
+      const perInstance: Record<string, { path: string; mtime: number }[]> = {};
+      for (const name of readdirSync(removedDir)) {
+        const path = join(removedDir, name);
+        const mtime = statSync(path).mtimeMs;
+        if (Date.now() - mtime > keepMs) {
+          rmSync(path, { recursive: true, force: true });
+          continue;
+        }
+        const id = name.replace(/-\d{4}-\d{2}-\d{2}T.*$/, '');
+        (perInstance[id] ??= []).push({ path, mtime });
+      }
+      for (const list of Object.values(perInstance)) {
+        list.sort((a, b) => b.mtime - a.mtime);
+        for (const old of list.slice(5)) rmSync(old.path, { recursive: true, force: true });
+      }
+    } catch (error) {
+      this.logger.warn(`login backup: prune failed: ${error?.message ?? error}`);
+    }
+  }
+
   public async cleaningUp(instanceName: string) {
     let instanceDbId: string;
     if (this.db.SAVE_DATA.INSTANCE) {
@@ -169,7 +238,7 @@ export class WAMonitoringService {
           data: { connectionStatus: 'close' },
         });
 
-        rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
+        await this.backupLogin(instance.id, instanceName, findInstance);
 
         instanceDbId = instance.id;
         await this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } });
@@ -200,7 +269,7 @@ export class WAMonitoringService {
 
     if (!instance) return;
 
-    rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
+    await this.backupLogin(instance.id, instanceName, instance);
 
     await this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } });
 
@@ -463,6 +532,22 @@ export class WAMonitoringService {
         });
       } finally {
         this.logger.warn(`Instance "${instanceName}" - NOT CONNECTION`);
+      }
+
+      // darnabt: the QR limit was reached and nobody scanned, so this number has no login. Every QR wrote
+      // connectionStatus 'connecting' to the database; left there, the next bridge start auto-connects it and runs
+      // another unattended QR loop (WhatsApp ends each unscanned QR socket after ~3.5 min → 428 → reconnect, 12
+      // times). Record 'close' so a boot skips it until someone asks for a QR again.
+      try {
+        if (this.db.SAVE_DATA.INSTANCE) {
+          await this.prismaRepository.instance.updateMany({
+            where: { name: instanceName, connectionStatus: 'connecting' },
+            data: { connectionStatus: 'close' },
+          });
+          this.logger.warn(`Instance "${instanceName}" - QR limit reached, saved as close`);
+        }
+      } catch (error) {
+        this.logger.error(`Instance "${instanceName}" - could not save close after QR limit: ${error?.message ?? error}`);
       }
     });
   }
