@@ -6,11 +6,13 @@
 //                                                   409 while a number is pairing or just paired)
 //                                                   ONLY when LIVENESS_PROCESS_RESTART=true (default off:
 //                                                   not registered → the framework's own 404, as before)
+//   POST     /instance/appStateRepair/:instanceName  one-shot app-state repair (global key; 409 not open; 429 within 6 h)
 // None of them logs out, deletes a session or pairs a device.
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { authGuard } from '@api/guards/auth.guard';
 import { livenessService, processRestartEnabled } from '@api/services/liveness.service';
+import { Auth, configService } from '@config/env.config';
 import { RequestHandler, Router } from 'express';
 
 import { HttpStatus } from './index.router';
@@ -58,6 +60,26 @@ export class LivenessRouter extends RouterBroker {
         return res.status(202).json(response);
       });
     }
+
+    // darnabt 2026-11-20 F4: one-shot app-state repair. Global API key only (authGuard['apikey'] alone, like
+    // processRestart — an instance token never passes). 409 not open, 429 within 6 h, else 202 at once.
+    const globalKeyOnly: RequestHandler = (req, res, next) => {
+      // authGuard['apikey'] also lets the instance's own token in when the path names the instance
+      if (req.get('apikey') !== configService.get<Auth>('AUTHENTICATION').API_KEY.KEY) {
+        return res.status(401).json({ status: 401, error: 'Unauthorized', message: ['Global API key required'] });
+      }
+      return next();
+    };
+    this.router.post(this.routerPath('appStateRepair'), globalKeyOnly, async (req, res) => {
+      const response = await this.dataValidate<InstanceDto>({
+        request: req,
+        schema: null,
+        ClassRef: InstanceDto,
+        execute: (instance) => livenessService.appStateRepair(instance.instanceName),
+      });
+
+      return res.status(202).json(response);
+    });
 
     livenessService.startSelfCheck();
   }

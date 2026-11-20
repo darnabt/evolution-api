@@ -32,6 +32,8 @@ RUN node ./Docker/scripts/patch-baileys-history.js
 RUN node ./Docker/scripts/patch-baileys-appstate.js
 # darnabt: an ignored status@broadcast message gets a plain ack, not NACK 500 (the nack closed the stream every ~50 min)
 RUN node ./Docker/scripts/patch-baileys-status-ack.js
+# darnabt: an app-state key shared by a companion is stored for reading but never becomes our upload key
+RUN node ./Docker/scripts/patch-baileys-upload-key.js
 
 RUN ./Docker/scripts/generate_database.sh
 
