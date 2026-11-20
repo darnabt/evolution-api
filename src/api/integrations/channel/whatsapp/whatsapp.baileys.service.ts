@@ -244,7 +244,6 @@ const labelResyncAt = new Map<string, number>();
 // darnabt 2026-11-20 F4: instances whose first app-state key round after this start already ran
 const appStateFirstAskDone = new Set<string>();
 // darnabt 2026-11-20 F4: the risky half (fatal-exception notice + upload despite missing keys) — off unless exactly 'true'
-const appStateFatalFallbackOn = () => process.env.APPSTATE_FATAL_FALLBACK === 'true';
 const LABEL_RESYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export class BaileysStartupService extends ChannelStartupService {
@@ -4564,7 +4563,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const sampled = Object.values(keyStats);
     const allClean =
       sampled.length > 0 &&
-      sampled.every((s) => s.bad === 0 && (s.missing === 0 || appStateFatalFallbackOn())) &&
+      sampled.every((s) => s.bad === 0 && s.missing === 0) &&
       sampled.some((s) => s.ok > 0) &&
       skippedRemoves === 0;
     if (macResult === 'MISMATCH' && !macMatched.length && allClean) {
@@ -4802,6 +4801,86 @@ export class BaileysStartupService extends ChannelStartupService {
     return { version, keyIds: [...keyIds], stats, total };
   }
 
+  // darnabt 2026-11-20 F4 one-shot repair (POST /instance/appStateRepair/:instance, global key, 6 h stamp in
+  // liveness.service). Never runs on its own. (a) per-device key ask; (b) only if keys are still missing after it:
+  // APP_STATE_FATAL_EXCEPTION_NOTIFICATION {regular_low} to own devices, so the primary re-uploads a fresh
+  // regular_low snapshot under its own key; (c) wait up to 120 s for that snapshot's server_sync, then resync
+  // regular_low from v0 and log what still cannot be read. The upload rule is NOT relaxed here.
+  public async appStateRepair() {
+    const sock: any = this.client;
+    const tag = `app-state repair ${this.instance.name}:`;
+    if (!sock?.authState?.creds?.me?.id || this.stateConnection?.state !== 'open') {
+      this.logger.warn(`${tag} stopped — number is not open`);
+      return;
+    }
+    const keys: any = sock.authState.keys;
+    this.logger.warn(`${tag} step a — asking own devices for missing keys`);
+    this.appStateLastKeyRequest = Date.now();
+    const a: any = await this.requestAppStateKeys({ collections: ['regular_low'], waitSeconds: 60, auto: true });
+    this.logger.warn(`${tag} step a done — keysChanged ${a?.keysChanged ?? 0}, stillMissing ${a?.stillMissing ?? '?'}`);
+    const scan0 = await this.scanAppStateKeys('regular_low');
+    if (!scan0.total.missing) {
+      this.logger.warn(`${tag} no unreadable regular_low records after step a (ok ${scan0.total.ok}) — done, no fatal notice`);
+      return;
+    }
+    if (this.stateConnection?.state !== 'open') {
+      this.logger.warn(`${tag} stopped before step b — number is no longer open`);
+      return;
+    }
+    // (c) listener first, so a fast primary answer is not missed (Baileys socket emits CB:<tag>,<attr>:<value>)
+    let synced = false;
+    const onSync = (node: any) => {
+      const cols = (node?.content || []).flatMap((c: any) => (Array.isArray(c?.content) ? c.content : [c]));
+      if (cols.some((c: any) => c?.attrs?.name === 'regular_low') || !cols.length) synced = true;
+    };
+    sock.ws.on('CB:notification,type:server_sync', onSync);
+    try {
+      await sock.relayMessage(
+        jidNormalizedUser(sock.authState.creds.me.id),
+        {
+          protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
+            appStateFatalExceptionNotification: { collectionNames: ['regular_low'], timestamp: Date.now() },
+          },
+        },
+        {
+          additionalAttributes: { category: 'peer', push_priority: 'high_force' },
+          additionalNodes: [{ tag: 'meta', attrs: { appdata: 'default' } }],
+        },
+      );
+      this.logger.warn(`${tag} step b — fatal-exception notice sent for regular_low (${scan0.total.missing} unreadable sampled records)`);
+      const t0 = Date.now();
+      while (!synced && Date.now() - t0 < 120_000) await delay(2000);
+      this.logger.warn(
+        `${tag} step c — ${synced ? `primary sent regular_low after ${Math.round((Date.now() - t0) / 1000)} s` : 'no regular_low update from the primary in 120 s'}; resyncing regular_low from v0`,
+      );
+    } finally {
+      sock.ws.off('CB:notification,type:server_sync', onSync);
+    }
+    if (this.stateConnection?.state !== 'open') {
+      this.logger.warn(`${tag} stopped before resync — number is no longer open`);
+      return;
+    }
+    this.appStateOwnWrite = true;
+    try {
+      await keys.set({ 'app-state-sync-version': { regular_low: null } });
+    } finally {
+      this.appStateOwnWrite = false;
+    }
+    this.appStateRebuilt.delete('regular_low');
+    try {
+      await sock.resyncAppState(['regular_low'], true);
+    } catch (error) {
+      this.logger.warn(`${tag} resync error: ${error}`);
+    }
+    const st = (await keys.get('app-state-sync-version', ['regular_low']))['regular_low'];
+    const scan1 = await this.scanAppStateKeys('regular_low');
+    if (st && !scan1.total.missing) this.appStateKeyFailed.delete('regular_low');
+    this.logger.warn(
+      `${tag} result — regular_low ${st ? `resynced ok (v${st.version})` : 'still failing (dropped by Baileys)'}; sampled records ok ${scan1.total.ok}, unreadable ${scan1.total.missing}, bad ${scan1.total.bad} (before: ok ${scan0.total.ok}, unreadable ${scan0.total.missing})`,
+    );
+  }
+
   // Repair a linked device whose stored app-state sync keys are wrong ("bad decrypt" when
   // resyncing regular_low etc.) WITHOUT re-linking: ask our own primary phone to re-share the
   // keys with an APP_STATE_SYNC_KEY_REQUEST — a hidden peer protocol message to our own JID,
@@ -4985,38 +5064,6 @@ export class BaileysStartupService extends ChannelStartupService {
     if (changed.length) this.clearAppStateNotReady(`the phone shared ${changed.length} new key(s)`);
     else if (shares && stillMissing.length) this.markAppStateNotReady(stillMissing, keyIds);
     else if (shares) this.clearAppStateNotReady('the phone answered and no app-state key is missing');
-    // darnabt 2026-11-20 F4 fallback (OFF unless APPSTATE_FATAL_FALLBACK=true): no key arrived 60 s after asking
-    // the companions -> tell own devices regular_low is fatally broken, then resync it from v0
-    if (appStateFatalFallbackOn() && companions.length && !changed.length) {
-      try {
-        await sock.relayMessage(
-          jidNormalizedUser(sock.authState.creds.me.id),
-          {
-            protocolMessage: {
-              type: proto.Message.ProtocolMessage.Type.APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
-              appStateFatalExceptionNotification: { collectionNames: ['regular_low'], timestamp: Date.now() },
-            },
-          },
-          {
-            additionalAttributes: { category: 'peer', push_priority: 'high_force' },
-            additionalNodes: [{ tag: 'meta', attrs: { appdata: 'default' } }],
-          },
-        );
-        this.logger.warn(`app-state fatal-exception notice sent for regular_low (fallback on)`);
-        this.appStateOwnWrite = true;
-        try {
-          await keys.set({ 'app-state-sync-version': { regular_low: null } });
-        } finally {
-          this.appStateOwnWrite = false;
-        }
-        this.appStateRebuilt.delete('regular_low');
-        await sock.resyncAppState(['regular_low'], true);
-        const st = (await keys.get('app-state-sync-version', ['regular_low']))['regular_low'];
-        this.logger.warn(`app-state regular_low ${st ? `resynced ok (v${st.version})` : 'still failing (dropped by Baileys)'}`);
-      } catch (error) {
-        this.logger.warn(`app-state regular_low still failing (fallback: ${error})`);
-      }
-    }
     if (!shares && !changed.length) {
       return { ok: false, ...answer, before, message: 'The phone did not answer the key request; nothing was changed.' };
     }

@@ -700,6 +700,44 @@ export class LivenessService {
       this.healRunning = false;
     }
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // App-state repair (F4, one shot): POST /instance/appStateRepair/:instanceName, global key only.
+  // 409 unless the number is open; 429 if run for that number in the last 6 h (stamp on the volume,
+  // survives restarts). Answers 202 at once; the repair itself runs in the background and logs each step.
+  // ---------------------------------------------------------------------------------------------
+
+  public async appStateRepair(instanceName: string): Promise<{ started: true; instance: string; at: string }> {
+    const instance: any = waMonitor?.waInstances?.[instanceName];
+    const state: string | null = instance?.connectionStatus?.state ?? null;
+    if (!instance || state !== 'open' || typeof instance.appStateRepair !== 'function') {
+      throw new LivenessConflictException(`${instanceName} is not open (state ${state ?? 'not loaded'}); repair refused.`);
+    }
+    const stamp = join(INSTANCE_DIR, `.appstate-repair-${instanceName.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+    let last: number | null = null;
+    try {
+      last = Number(JSON.parse(await fsp.readFile(stamp, 'utf8'))?.at) || null;
+    } catch (error) {
+      if ((error as any)?.code !== 'ENOENT') this.logger.warn(`appStateRepair: stamp unreadable, treated as none (${String(error)})`);
+    }
+    const now = Date.now();
+    if (last && now - last < 6 * 3600_000) {
+      throw new TooManyRequestsException(
+        `app-state repair already ran for ${instanceName} at ${new Date(last).toISOString()}; next allowed after ${new Date(last + 6 * 3600_000).toISOString()}.`,
+      );
+    }
+    try {
+      await fsp.mkdir(INSTANCE_DIR, { recursive: true });
+      const tmp = `${stamp}.${process.pid}.tmp`;
+      await fsp.writeFile(tmp, JSON.stringify({ at: now, iso: new Date(now).toISOString(), pid: process.pid }));
+      await fsp.rename(tmp, stamp);
+    } catch (error) {
+      throw new LivenessInternalException('Could not record the repair stamp; repair refused.', String(error));
+    }
+    this.logger.warn(`app-state repair ${instanceName}: started by API`);
+    instance.appStateRepair().catch((e: any) => this.logger.warn(`app-state repair ${instanceName}: failed: ${e}`));
+    return { started: true, instance: instanceName, at: new Date(now).toISOString() };
+  }
 }
 
 export const livenessService = new LivenessService();
