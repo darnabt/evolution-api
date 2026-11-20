@@ -2380,6 +2380,46 @@ export class BaileysStartupService extends ChannelStartupService {
                   );
                 }
               }
+              // darnabt 2026-11-20 (T8, owner «for the ticks in groups … when someone reads it, the server sends»):
+              // receipts from OTHER members on OUR group messages were dropped above (only our own reads go out),
+              // so every group message stayed «sent» in Nawah. Forward each member's delivery / read / played
+              // ONCE as messages.update with a GROUP_RECEIPT_* status + participant. Those statuses are unknown to
+              // Nawah's 1:1 tick path, so an older Nawah ignores them; the new one counts members in SQL.
+              const own = new Set(
+                [this.instance.wuid, this.client?.user?.id, (this.client?.user as any)?.lid]
+                  .filter((j): j is string => typeof j === 'string')
+                  .map((j) => j.replace(/:\d+@/, '@')),
+              );
+              const memberReceipts = payload
+                .filter(
+                  (e) =>
+                    typeof e.key?.remoteJid === 'string' &&
+                    e.key.remoteJid.endsWith('@g.us') &&
+                    typeof e.key?.id === 'string' &&
+                    e.key?.fromMe === true &&
+                    typeof e.receipt?.userJid === 'string' &&
+                    !own.has(e.receipt.userJid.replace(/:\d+@/, '@')),
+                )
+                .map((e) => {
+                  const r = e.receipt as any;
+                  const status =
+                    typeof r.playedTimestamp === 'number' || (r.playedTimestamp && Number(r.playedTimestamp) > 0)
+                      ? 'GROUP_RECEIPT_PLAYED'
+                      : typeof r.readTimestamp === 'number' || (r.readTimestamp && Number(r.readTimestamp) > 0)
+                        ? 'GROUP_RECEIPT_READ'
+                        : 'GROUP_RECEIPT_DELIVERY';
+                  const ts = Number(r.playedTimestamp ?? r.readTimestamp ?? r.receiptTimestamp) || null;
+                  return {
+                    keyId: e.key.id,
+                    remoteJid: e.key.remoteJid,
+                    fromMe: true,
+                    participant: r.userJid,
+                    status,
+                    receiptTimestamp: ts,
+                    instanceId: this.instanceId,
+                  };
+                });
+              if (memberReceipts.length > 0) this.sendDataWebhook(Events.MESSAGES_UPDATE, memberReceipts);
             }
 
             if (events['presence.update']) {
