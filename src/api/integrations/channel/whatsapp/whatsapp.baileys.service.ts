@@ -125,6 +125,8 @@ import makeWASocket, {
   isJidGroup,
   isJidNewsletter,
   isPnUser,
+  jidDecode,
+  jidEncode,
   jidNormalizedUser,
   LT_HASH_ANTI_TAMPERING,
   makeCacheableSignalKeyStore,
@@ -239,6 +241,10 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
 
 // Last full label app-state resync per instance (process-local; first connect after start always runs).
 const labelResyncAt = new Map<string, number>();
+// darnabt 2026-11-20 F4: instances whose first app-state key round after this start already ran
+const appStateFirstAskDone = new Set<string>();
+// darnabt 2026-11-20 F4: the risky half (fatal-exception notice + upload despite missing keys) — off unless exactly 'true'
+const appStateFatalFallbackOn = () => process.env.APPSTATE_FATAL_FALLBACK === 'true';
 const LABEL_RESYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export class BaileysStartupService extends ChannelStartupService {
@@ -552,6 +558,19 @@ export class BaileysStartupService extends ChannelStartupService {
         profilePictureUrl: this.instance.profilePictureUrl,
         ...this.stateConnection,
       });
+
+      // darnabt 2026-11-20 F4: the first key round after a start runs once, 2 min after open (proves a deploy at once);
+      // later rounds keep the 6 h repair-throttle (appStateNotReady)
+      if (!appStateFirstAskDone.has(this.instance.name)) {
+        appStateFirstAskDone.add(this.instance.name);
+        setTimeout(() => {
+          if (this.stateConnection?.state !== 'open') return;
+          this.appStateLastKeyRequest = Date.now();
+          this.requestAppStateKeys({ waitSeconds: 60, auto: true }).catch((e) =>
+            this.logger.warn(`app-state first key round failed: ${e}`),
+          );
+        }, 120_000);
+      }
 
       // Resync all app state patches so labeled chats populate Chat.labels in DB
       // Throttled: a full resync re-emits every contact (thousands of webhooks/DB writes), so at most once per 6 h per instance.
@@ -4544,7 +4563,10 @@ export class BaileysStartupService extends ChannelStartupService {
     // REMOVE was orphaned, the rebuilt hash is the true one — upload anyway, loudly. Any other case still refuses.
     const sampled = Object.values(keyStats);
     const allClean =
-      sampled.length > 0 && sampled.every((s) => s.bad === 0 && s.missing === 0) && skippedRemoves === 0;
+      sampled.length > 0 &&
+      sampled.every((s) => s.bad === 0 && (s.missing === 0 || appStateFatalFallbackOn())) &&
+      sampled.some((s) => s.ok > 0) &&
+      skippedRemoves === 0;
     if (macResult === 'MISMATCH' && !macMatched.length && allClean) {
       this.logger.warn(`${name} MAC mismatch accepted (all records clean) — uploading (v${version})`);
       this.appStateMacForced.add(name);
@@ -4803,7 +4825,7 @@ export class BaileysStartupService extends ChannelStartupService {
       Array.isArray(data?.collections) && data.collections.length
         ? data.collections
         : ['regular_low', 'regular_high', 'regular', 'critical_block', 'critical_unblock_low'];
-    const waitMs = Math.min(Math.max(Number(data?.waitSeconds ?? 90), 5), 280) * 1000;
+    let waitMs = Math.min(Math.max(Number(data?.waitSeconds ?? 90), 5), 280) * 1000;
     const myKeyIdBefore: string = sock.authState.creds.myAppStateKeyId;
 
     // 1. key ids the server data uses + what we can decrypt now
@@ -4840,12 +4862,49 @@ export class BaileysStartupService extends ChannelStartupService {
         const p = m?.message?.protocolMessage;
         if (p?.type === proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_SHARE) {
           shares++;
+          const from = jidDecode(m?.key?.participant || m?.key?.remoteJid || '')?.device ?? '?';
+          let n = 0;
           for (const k of p.appStateSyncKeyShare?.keys || []) {
-            shared.push(Buffer.from(k?.keyId?.keyId || []).toString('base64'));
+            const id = Buffer.from(k?.keyId?.keyId || []).toString('base64');
+            shared.push(id);
+            if (missingIds.includes(id)) n++;
           }
+          if (n) this.logger.warn(`app-state keys arrived: ${n} (from device ${from})`);
         }
       }
     };
+    // darnabt 2026-11-20 F4: a key id's first 2 bytes are the device that created it (AAAA.. = phone :0,
+    // AEwA.. = :76, AE0A.. = :77). Keys we lack were made by other companions -> ask each of them directly
+    // (Baileys' 'peer' relay to meJid reaches only device 0). Only devices WhatsApp still lists count.
+    const missingIds = keyIds.filter((id) => !fpBefore[id]);
+    const me = jidDecode(sock.authState.creds.me.id);
+    const creatorOf = (id: string) => {
+      const b = Buffer.from(id, 'base64');
+      return b.length >= 2 ? b.readUInt16BE(0) : -1;
+    };
+    const creators = [...new Set(missingIds.map(creatorOf))].filter((d) => d > 0 && d !== me.device);
+    let listed: number[] = [];
+    if (creators.length) {
+      try {
+        const own = await sock.getUSyncDevices([jidEncode(me.user, 's.whatsapp.net')], false, false);
+        listed = (own || []).filter((d: any) => d.user === me.user).map((d: any) => Number(d.device));
+      } catch (error) {
+        this.logger.warn(`app-state key ask: device list failed: ${error}`);
+      }
+    }
+    const companions = creators.filter((d) => listed.includes(d));
+    if (missingIds.length) {
+      this.logger.warn(
+        `app-state key ask: ${missingIds.length} missing keys from devices [${[...new Set(missingIds.map(creatorOf))]
+          .map((d) => ':' + d)
+          .join(',')}] → asked [:0${companions.map((d) => ',:' + d).join('')}]${
+          creators.length > companions.length
+            ? ` (not listed by WhatsApp: ${creators.filter((d) => !listed.includes(d)).map((d) => ':' + d).join(',')})`
+            : ''
+        }`,
+      );
+    }
+    const allArrived = () => missingIds.every((id) => shared.includes(id));
     sock.ev.on('messages.upsert', onUpsert);
     let requestId = '';
     const startedAt = Date.now();
@@ -4865,7 +4924,42 @@ export class BaileysStartupService extends ChannelStartupService {
         },
       );
       this.logger.warn(`app-state key request ${requestId} sent to own phone for ${keyIds.length} key ids`);
-      while (Date.now() - startedAt < waitMs && shares === 0) await delay(2000);
+      for (const d of companions) {
+        const jid = jidEncode(me.user, 's.whatsapp.net', d);
+        try {
+          await sock.assertSessions([jid], false);
+          // explicit participant -> Baileys sends to exactly that device (messages-send.js:430-439, 689-700)
+          const id = await sock.relayMessage(
+            meJid,
+            {
+              protocolMessage: {
+                type: proto.Message.ProtocolMessage.Type.APP_STATE_SYNC_KEY_REQUEST,
+                appStateSyncKeyRequest: {
+                  keyIds: missingIds
+                    .filter((k) => creatorOf(k) === d)
+                    .map((k) => ({ keyId: Buffer.from(k, 'base64') })),
+                },
+              },
+            },
+            {
+              participant: { jid, count: 0 },
+              additionalAttributes: { category: 'peer', push_priority: 'high_force' },
+              additionalNodes: [{ tag: 'meta', attrs: { appdata: 'default' } }],
+            },
+          );
+          this.logger.warn(`app-state key request ${id} sent to own device :${d}`);
+        } catch (error) {
+          this.logger.warn(`app-state key request to device :${d} failed: ${error}`);
+        }
+      }
+      // phone only: stop at its first answer (as before). Companions asked: wait at least 60 s for their keys
+      const minWait = companions.length ? Math.min(60_000, waitMs) : 0;
+      if (companions.length) waitMs = Math.max(waitMs, 60_000);
+      while (
+        Date.now() - startedAt < waitMs &&
+        (shares === 0 || (companions.length && !allArrived() && Date.now() - startedAt < minWait))
+      )
+        await delay(2000);
       if (shares) await delay(4000); // let Baileys finish storing the keys
     } finally {
       sock.ev.off('messages.upsert', onUpsert);
@@ -4891,6 +4985,38 @@ export class BaileysStartupService extends ChannelStartupService {
     if (changed.length) this.clearAppStateNotReady(`the phone shared ${changed.length} new key(s)`);
     else if (shares && stillMissing.length) this.markAppStateNotReady(stillMissing, keyIds);
     else if (shares) this.clearAppStateNotReady('the phone answered and no app-state key is missing');
+    // darnabt 2026-11-20 F4 fallback (OFF unless APPSTATE_FATAL_FALLBACK=true): no key arrived 60 s after asking
+    // the companions -> tell own devices regular_low is fatally broken, then resync it from v0
+    if (appStateFatalFallbackOn() && companions.length && !changed.length) {
+      try {
+        await sock.relayMessage(
+          jidNormalizedUser(sock.authState.creds.me.id),
+          {
+            protocolMessage: {
+              type: proto.Message.ProtocolMessage.Type.APP_STATE_FATAL_EXCEPTION_NOTIFICATION,
+              appStateFatalExceptionNotification: { collectionNames: ['regular_low'], timestamp: Date.now() },
+            },
+          },
+          {
+            additionalAttributes: { category: 'peer', push_priority: 'high_force' },
+            additionalNodes: [{ tag: 'meta', attrs: { appdata: 'default' } }],
+          },
+        );
+        this.logger.warn(`app-state fatal-exception notice sent for regular_low (fallback on)`);
+        this.appStateOwnWrite = true;
+        try {
+          await keys.set({ 'app-state-sync-version': { regular_low: null } });
+        } finally {
+          this.appStateOwnWrite = false;
+        }
+        this.appStateRebuilt.delete('regular_low');
+        await sock.resyncAppState(['regular_low'], true);
+        const st = (await keys.get('app-state-sync-version', ['regular_low']))['regular_low'];
+        this.logger.warn(`app-state regular_low ${st ? `resynced ok (v${st.version})` : 'still failing (dropped by Baileys)'}`);
+      } catch (error) {
+        this.logger.warn(`app-state regular_low still failing (fallback: ${error})`);
+      }
+    }
     if (!shares && !changed.length) {
       return { ok: false, ...answer, before, message: 'The phone did not answer the key request; nothing was changed.' };
     }
@@ -4918,6 +5044,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const state = (await keys.get('app-state-sync-version', [name]))[name];
       if (state) this.appStateKeyFailed.delete(name); // Baileys read every record -> no key is missing there
       resync[name] = state ? `synced v${state.version}` : 'FAILED (Baileys dropped it — LOG_BAILEYS=info shows why)';
+      this.logger.warn(`app-state ${name} ${state ? 'resynced ok' : 'still failing (' + resync[name] + ')'}`);
     }
 
     // 4. decrypt check again
