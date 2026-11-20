@@ -65,6 +65,7 @@ class Key {
   id: string;
   fromMe: boolean;
   remoteJid: string;
+  participant?: string;
 }
 export class ReadMessageDto {
   readMessages: Key[];

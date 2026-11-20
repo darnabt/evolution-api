@@ -4238,9 +4238,20 @@ export class BaileysStartupService extends ChannelStartupService {
   public async markMessageAsRead(data: ReadMessageDto) {
     try {
       const keys: proto.IMessageKey[] = [];
+      // darnabt 2026-11-20 (k1120 wa-unread-sync): a 1:1 chat WhatsApp keeps under its @lid gets its receipt under
+      // the @lid. Before, @lid keys were dropped here without a word, so a read in Nawah never reached the phone for
+      // those chats (proven 2026-11-20 on three Dar Nabt chats: the chat-level read mark
+      // landed, the phone kept its unread count). A group key keeps the member who sent it (`participant`).
       data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
-          keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
+        const jid = read.remoteJid || '';
+        if (isJidGroup(jid) || isPnUser(jid) || jid.endsWith('@lid')) {
+          const participant = (read as { participant?: string }).participant;
+          keys.push({
+            remoteJid: jid,
+            fromMe: read.fromMe,
+            id: read.id,
+            ...(isJidGroup(jid) && participant ? { participant } : {}),
+          });
         }
       });
       // darnabt 2026-10-03: always 'read-self' (syncs the read to our own phone/Web, never a blue tick to the
